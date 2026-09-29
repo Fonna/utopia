@@ -4,7 +4,7 @@
 use crate::llm_util;
 use crate::state::AppState;
 use futures_util::{stream, StreamExt};
-use utopia_core::models::{LlmSettings, Proposer};
+use utopia_core::models::{Document, LlmSettings, Proposer};
 use utopia_llm::LlmClient;
 use uuid::Uuid;
 
@@ -47,7 +47,18 @@ const EMBED_BATCH: usize = 16;
 const EMBED_JOBS: usize = 4;
 
 pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
-    match run(state, document_id).await {
+    let mut ark = None;
+    let outcome = async {
+        match prepare_ark_read(state, document_id, &mut ark).await? {
+            ArkPreparation::Skip => Ok(()),
+            ArkPreparation::Original => run(state, document_id, None, &mut ark).await,
+            ArkPreparation::Prepared(prepared) => {
+                run(state, document_id, Some(*prepared), &mut ark).await
+            }
+        }
+    }
+    .await;
+    match outcome {
         Ok(()) => Ok(()),
         // 在等读字的服务读完：文档照旧是 parsing，任务过一会儿再来问
         Err(e) if utopia_core::is_deferred(&e).is_some() => Err(e),
@@ -66,6 +77,40 @@ pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Re
                     e.downcast_ref::<utopia_ingest::NoSpeakers>()
                         .map(|_| utopia_ingest::Reader::Transcribe)
                 });
+            if let Some(ark) = &ark {
+                let failed = utopia_store::documents::fail_ark_ocr_if_current(
+                    &state.pool,
+                    document_id,
+                    &ark.snapshot,
+                    &format!("{e:#}"),
+                    waiting.map(|reader| reader.as_str()),
+                )
+                .await?;
+                if !failed {
+                    return discard_ark_read(state, document_id, &ark.snapshot.sha256).await;
+                }
+                if let (Some(reader), Some(doc)) = (waiting, &doc) {
+                    crate::alerting::observe_document_needs_reader(
+                        state,
+                        doc.kb_id,
+                        document_id,
+                        &doc.filename,
+                        reader,
+                        &e.to_string(),
+                    )
+                    .await;
+                }
+                if let Some(doc) = &doc {
+                    state.emit_document(doc.kb_id, document_id);
+                }
+                return if waiting.is_some()
+                    || e.downcast_ref::<utopia_ingest::Unreadable>().is_some()
+                {
+                    Err(e.context(utopia_core::Terminal))
+                } else {
+                    Err(e)
+                };
+            }
             if let Some(reader) = waiting {
                 let _ = utopia_store::documents::set_needs_reader(
                     &state.pool,
@@ -102,8 +147,278 @@ pub async fn process_document(state: &AppState, document_id: Uuid) -> anyhow::Re
     }
 }
 
-async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
-    let doc = utopia_store::documents::get(&state.pool, document_id).await?;
+struct PreparedRead {
+    doc: Document,
+    bytes: Vec<u8>,
+    parsed: anyhow::Result<utopia_ingest::ParsedDoc>,
+}
+
+enum ArkPreparation {
+    Original,
+    Prepared(Box<PreparedRead>),
+    Skip,
+}
+
+struct ArkReadRun {
+    // 从首次状态变化前一直握到后处理、错误落库结束。
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    snapshot: utopia_store::documents::ArkOcrSnapshot,
+}
+
+fn wait_for_ark_change() -> anyhow::Error {
+    anyhow::anyhow!("the Ark OCR document or configuration changed").context(
+        utopia_core::Deferred::new(std::time::Duration::from_secs(1)),
+    )
+}
+
+// 已确认方舟但尚未得到完整快照时，没有权限落失败状态；下轮重新取得写入权。
+fn retry_ark_preparation(error: impl Into<anyhow::Error>) -> anyhow::Error {
+    error
+        .into()
+        .context(utopia_core::Deferred::new(std::time::Duration::from_secs(
+            1,
+        )))
+}
+
+/// 只在已配置方舟时预检；普通正文、文本 PDF、录音不取得方舟快照或锁。
+/// 预检结果交给原流程接着用，避免重复解析。其它供应商保持原来的准备顺序。
+async fn prepare_ark_read(
+    state: &AppState,
+    document_id: Uuid,
+    ark: &mut Option<ArkReadRun>,
+) -> anyhow::Result<ArkPreparation> {
+    let Ok(doc) = utopia_store::documents::get(&state.pool, document_id).await else {
+        return Ok(ArkPreparation::Original);
+    };
+    if doc.deleted_at.is_some() {
+        return Ok(ArkPreparation::Skip);
+    }
+    let Ok(kb) = utopia_store::kbs::get(&state.pool, doc.kb_id).await else {
+        return Ok(ArkPreparation::Original);
+    };
+    let Ok(settings) = utopia_store::settings::get(&state.pool, kb.workspace_id).await else {
+        return Ok(ArkPreparation::Original);
+    };
+    if !settings
+        .as_ref()
+        .is_some_and(|settings| settings.ocr_provider == "ark")
+    {
+        return Ok(ArkPreparation::Original);
+    }
+    // 已有检查点证明同一文件曾走方舟 OCR；原文暂时不可读也要保护已经付费的页。
+    let stored = utopia_store::documents::reader_task(&state.pool, document_id)
+        .await
+        .map_err(retry_ark_preparation)?;
+    let known_ark = stored.as_ref().is_some_and(|task| {
+        task["reader"] == "ocr" && task["provider"] == "ark" && task["sha256"] == doc.sha256
+    });
+    let doc = if known_ark {
+        let Some(current) = acquire_ark_run(state, &doc, kb.workspace_id, ark).await? else {
+            return Ok(ArkPreparation::Skip);
+        };
+        current
+    } else {
+        doc
+    };
+    let bytes = state.blob.get(&doc.sha256).await?;
+    let filename = doc.filename.clone();
+    let (parsed, bytes) =
+        tokio::task::spawn_blocking(move || (utopia_ingest::parse(&filename, &bytes), bytes))
+            .await?;
+    let needs_ocr = parsed
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<utopia_ingest::NeedsReader>())
+        .is_some_and(|needs| matches!(needs.reader, utopia_ingest::Reader::Ocr));
+    if !needs_ocr {
+        if parsed.is_ok()
+            || parsed
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<utopia_ingest::NeedsReader>())
+                .is_some_and(|needs| matches!(needs.reader, utopia_ingest::Reader::Transcribe))
+        {
+            // 解析器现在能直接读取原文，或输入属于转写；不把方舟约束推广给它们。
+            *ark = None;
+        }
+        return Ok(ArkPreparation::Prepared(Box::new(PreparedRead {
+            doc,
+            bytes,
+            parsed,
+        })));
+    }
+    let current = if ark.is_none() {
+        let Some(current) = acquire_ark_run(state, &doc, kb.workspace_id, ark).await? else {
+            return Ok(ArkPreparation::Skip);
+        };
+        current
+    } else {
+        doc
+    };
+    Ok(ArkPreparation::Prepared(Box::new(PreparedRead {
+        doc: current,
+        bytes,
+        parsed,
+    })))
+}
+
+async fn acquire_ark_run(
+    state: &AppState,
+    doc: &Document,
+    workspace_id: Uuid,
+    ark: &mut Option<ArkReadRun>,
+) -> anyhow::Result<Option<Document>> {
+    let document_id = doc.id;
+    let guard = crate::readers::ark_checkpoint::try_lock_document(document_id)?;
+    let current = utopia_store::documents::get(&state.pool, document_id)
+        .await
+        .map_err(retry_ark_preparation)?;
+    if current.deleted_at.is_some() {
+        return Ok(None);
+    }
+    if current.sha256 != doc.sha256 {
+        return Err(wait_for_ark_change());
+    }
+    let settings = utopia_store::settings::get(&state.pool, workspace_id)
+        .await
+        .map_err(retry_ark_preparation)?
+        .filter(|settings| settings.ocr_provider == "ark")
+        .ok_or_else(wait_for_ark_change)?;
+    let task = utopia_store::documents::reader_task(&state.pool, document_id)
+        .await
+        .map_err(retry_ark_preparation)?;
+    if current.status == "ready" && task.is_none() {
+        return Ok(None);
+    }
+    let snapshot = utopia_store::documents::ArkOcrSnapshot {
+        sha256: current.sha256.clone(),
+        configuration_fingerprint: utopia_store::settings::ocr_configuration_fingerprint(&settings),
+        prepared_updated_at: Some(current.updated_at),
+        task,
+    };
+    *ark = Some(ArkReadRun {
+        _guard: guard,
+        snapshot,
+    });
+    Ok(Some(current))
+}
+
+async fn discard_ark_read(state: &AppState, id: Uuid, sha256: &str) -> anyhow::Result<()> {
+    let current = utopia_store::documents::get(&state.pool, id).await?;
+    if current.deleted_at.is_some()
+        || current.sha256 != sha256
+        || (current.status == "ready"
+            && utopia_store::documents::reader_task(&state.pool, id)
+                .await?
+                .is_none())
+    {
+        Ok(())
+    } else {
+        Err(wait_for_ark_change())
+    }
+}
+
+async fn read_ark_pages(
+    state: &AppState,
+    doc: &Document,
+    settings: &LlmSettings,
+    bytes: &[u8],
+    ark: &mut ArkReadRun,
+) -> anyhow::Result<utopia_ingest::Reading> {
+    use crate::readers::{ark_checkpoint::Checkpoint, ark_ocr::ArkOcr};
+    if utopia_store::settings::ocr_configuration_fingerprint(settings)
+        != ark.snapshot.configuration_fingerprint
+    {
+        return Err(wait_for_ark_change());
+    }
+    let reader = ArkOcr::new(
+        settings.ocr_base_url.as_deref().unwrap_or_default(),
+        settings.ocr_api_key.as_deref(),
+        settings.ocr_model.as_deref().unwrap_or_default(),
+    );
+    reader.validate()?;
+    let mut checkpoint = match Checkpoint::from_task(
+        ark.snapshot.task.as_ref(),
+        &doc.sha256,
+        &ark.snapshot.configuration_fingerprint,
+    )? {
+        Some(checkpoint) => checkpoint,
+        None => Checkpoint::new(
+            &doc.sha256,
+            &ark.snapshot.configuration_fingerprint,
+            reader.page_count(bytes).await?,
+        )?,
+    };
+    let task = checkpoint.task()?;
+    if !utopia_store::documents::compare_and_set_ark_ocr_task(
+        &state.pool,
+        doc.id,
+        &ark.snapshot,
+        &task,
+    )
+    .await?
+    {
+        return Err(wait_for_ark_change());
+    }
+    ark.snapshot.task = Some(task);
+    ark.snapshot.prepared_updated_at = None;
+    state.emit_document(doc.kb_id, doc.id);
+    if let Some(page) = checkpoint.next_page() {
+        checkpoint.record_page(reader.read_page(bytes, page).await?)?;
+        let task = checkpoint.task()?;
+        if !utopia_store::documents::compare_and_set_ark_ocr_task(
+            &state.pool,
+            doc.id,
+            &ark.snapshot,
+            &task,
+        )
+        .await?
+        {
+            return Err(wait_for_ark_change());
+        }
+        ark.snapshot.task = Some(task);
+        if checkpoint.next_page().is_some() {
+            return Err(anyhow::anyhow!("the next Ark OCR page is queued").context(
+                utopia_core::Deferred::new(std::time::Duration::from_secs(1)),
+            ));
+        }
+    }
+    reader.reading(checkpoint.pages())
+}
+
+async fn processing_status(
+    state: &AppState,
+    doc: &Document,
+    ark: Option<&ArkReadRun>,
+    status: &str,
+) -> anyhow::Result<bool> {
+    if let Some(ark) = ark {
+        Ok(utopia_store::documents::set_ark_ocr_status_if_current(
+            &state.pool,
+            doc.id,
+            &ark.snapshot,
+            status,
+        )
+        .await?)
+    } else {
+        utopia_store::documents::set_status(&state.pool, doc.id, status).await?;
+        Ok(true)
+    }
+}
+
+async fn run(
+    state: &AppState,
+    document_id: Uuid,
+    prepared: Option<PreparedRead>,
+    ark: &mut Option<ArkReadRun>,
+) -> anyhow::Result<()> {
+    let (doc, prepared) = match prepared {
+        Some(prepared) => (prepared.doc, Some((prepared.parsed, prepared.bytes))),
+        None => (
+            utopia_store::documents::get(&state.pool, document_id).await?,
+            None,
+        ),
+    };
     // 排队之后被删了（#268）：墓碑不重建分块、不回索引；清过的连原文都没了
     if doc.deleted_at.is_some() {
         tracing::info!(document = %document_id, "skipping a deleted document");
@@ -111,13 +426,19 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
     }
 
     // 1. 解析（CPU 密集，放 blocking 线程）
-    utopia_store::documents::set_status(&state.pool, document_id, "parsing").await?;
-    state.emit_document(doc.kb_id, document_id);
-    let bytes = state.blob.get(&doc.sha256).await?;
-    let filename = doc.filename.clone();
-    let (parsed, bytes) =
-        tokio::task::spawn_blocking(move || (utopia_ingest::parse(&filename, &bytes), bytes))
-            .await?;
+    if ark.is_none() {
+        utopia_store::documents::set_status(&state.pool, document_id, "parsing").await?;
+        state.emit_document(doc.kb_id, document_id);
+    }
+    let (parsed, bytes) = match prepared {
+        Some(prepared) => prepared,
+        None => {
+            let bytes = state.blob.get(&doc.sha256).await?;
+            let filename = doc.filename.clone();
+            tokio::task::spawn_blocking(move || (utopia_ingest::parse(&filename, &bytes), bytes))
+                .await?
+        }
+    };
     let kb_row = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
     let settings = utopia_store::settings::get(&state.pool, kb_row.workspace_id).await?;
     let pushed_statements =
@@ -155,9 +476,19 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
             };
             let reading = match (needs.reader, settings.as_ref()) {
                 (utopia_ingest::Reader::Ocr, Some(s)) => {
-                    match crate::readers::Ocr::from_settings(s) {
-                        Some(ocr) => ocr.read(state, &doc, bytes).await?,
-                        None => return Err(e),
+                    if let Some(ark) = ark.as_mut() {
+                        if !s.ocr_ready() {
+                            return Err(e);
+                        }
+                        read_ark_pages(state, &doc, s, &bytes, ark).await?
+                    } else if s.ocr_provider == "ark" {
+                        // 设置在普通准备期间换成了方舟，下轮先取得它自己的锁和快照。
+                        return Err(wait_for_ark_change());
+                    } else {
+                        match crate::readers::Ocr::from_settings(s) {
+                            Some(ocr) => ocr.read(state, &doc, bytes).await?,
+                            None => return Err(e),
+                        }
                     }
                 }
                 (utopia_ingest::Reader::Transcribe, Some(s)) => {
@@ -179,24 +510,41 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
         }
     };
     let text_len = text.chars().count() as i32;
-    let Some(chunk_pairs) = utopia_store::documents::replace_chunks_if_current(
-        &state.pool,
-        doc.kb_id,
-        document_id,
-        &pieces,
-        &doc.sha256,
-    )
-    .await?
-    else {
+    let chunk_pairs = if let Some(ark) = ark.as_ref() {
+        utopia_store::documents::replace_ark_ocr_chunks_if_current(
+            &state.pool,
+            doc.kb_id,
+            document_id,
+            &pieces,
+            &ark.snapshot,
+        )
+        .await?
+    } else {
+        utopia_store::documents::replace_chunks_if_current(
+            &state.pool,
+            doc.kb_id,
+            document_id,
+            &pieces,
+            &doc.sha256,
+        )
+        .await?
+    };
+    let Some(chunk_pairs) = chunk_pairs else {
         // 读取期间源文档可能已更新或删除，丢弃过期结果，
         // 不再改写新任务的索引、状态和抽取队列。
         tracing::info!(%document_id, "discarding a superseded document read");
-        return Ok(());
+        return if ark.is_some() {
+            discard_ark_read(state, document_id, &doc.sha256).await
+        } else {
+            Ok(())
+        };
     };
     let chunk_count = chunk_pairs.len() as i32;
 
     // 3. 全文索引（Tantivy）
-    utopia_store::documents::set_status(&state.pool, document_id, "indexing").await?;
+    if !processing_status(state, &doc, ark.as_ref(), "indexing").await? {
+        return discard_ark_read(state, document_id, &doc.sha256).await;
+    }
     state.emit_document(doc.kb_id, document_id);
     let search = state.search.clone();
     let kb = doc.kb_id.to_string();
@@ -205,12 +553,53 @@ async fn run(state: &AppState, document_id: Uuid) -> anyhow::Result<()> {
 
     // 4. embedding（工作区配置了 embedding 模型才做；没配也算 ready，先享受 BM25 搜索）
     if let Some((settings, client)) = embedder(settings.as_ref()) {
-        utopia_store::documents::set_status(&state.pool, document_id, "embedding").await?;
+        if !processing_status(state, &doc, ark.as_ref(), "embedding").await? {
+            return discard_ark_read(state, document_id, &doc.sha256).await;
+        }
         state.emit_document(doc.kb_id, document_id);
         embed_pending(state, settings, &client, document_id).await?;
     }
 
-    utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
+    if let Some(ark) = ark.as_ref() {
+        if !utopia_store::documents::set_ark_ocr_ready_if_current(
+            &state.pool,
+            document_id,
+            &ark.snapshot,
+            text_len,
+            chunk_count,
+        )
+        .await?
+        {
+            return discard_ark_read(state, document_id, &doc.sha256).await;
+        }
+    } else {
+        utopia_store::documents::set_ready(&state.pool, document_id, text_len, chunk_count).await?;
+    }
+
+    if let Some(ark) = ark.as_ref() {
+        let graph_status = if !source_extracts(state, doc.source_id).await? {
+            Some("skipped")
+        } else if pushed_statements || settings.as_ref().is_some_and(|s| s.chat_ready()) {
+            Some("queued")
+        } else {
+            None
+        };
+        if !utopia_store::documents::finish_ark_ocr_if_current(
+            &state.pool,
+            document_id,
+            &ark.snapshot,
+            text_len,
+            chunk_count,
+            graph_status,
+        )
+        .await?
+        {
+            return discard_ark_read(state, document_id, &doc.sha256).await;
+        }
+        state.emit_document(doc.kb_id, document_id);
+        tracing::info!(%document_id, chunks = chunk_count, "文档处理完成");
+        return Ok(());
+    }
 
     // 来源说了不抽取的，到这里为止：可搜、可问，不进图。
     //

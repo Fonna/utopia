@@ -3,6 +3,50 @@ use utopia_core::models::LlmSettings;
 use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
+/// OCR 任务的配置身份只包含其实际输入；同一密钥的重新封印、其它卡片保存不改变它。
+/// 调用方必须先解封 OCR key。None 与空 key 等价，地址与读取器一样去掉末尾斜线。
+pub fn ocr_configuration_fingerprint(settings: &LlmSettings) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for value in [
+        settings.ocr_provider.as_str(),
+        settings
+            .ocr_base_url
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/'),
+        settings.ocr_model.as_deref().unwrap_or("").trim(),
+        settings.ocr_api_key.as_deref().unwrap_or(""),
+    ] {
+        // 长度前缀避免相邻字段拼接后出现同一身份。
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// 文档先锁、设置再锁，与检查点提交保持同一个短事务；只解封 OCR key。
+pub(crate) async fn locked_ocr_configuration_fingerprint(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+) -> AppResult<Option<String>> {
+    let row: Option<LlmSettings> =
+        sqlx::query_as("SELECT * FROM llm_settings WHERE workspace_id = $1 FOR SHARE")
+            .bind(workspace_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    row.map(|mut settings| {
+        settings.ocr_api_key =
+            secrets::open_opt(settings.ocr_api_key.as_deref()).map_err(AppError::Other)?;
+        Ok(ocr_configuration_fingerprint(&settings))
+    })
+    .transpose()
+}
+
 /// 出库即开封：四把 API key 在库里是封印的（`utopia_core::secrets`）。
 /// 任何返回 `LlmSettings` 的查询都从这里过
 fn opened(mut s: LlmSettings) -> AppResult<LlmSettings> {
@@ -121,6 +165,31 @@ pub async fn upsert_ocr_with_provider(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> AppResult<LlmSettings> {
+    let mut tx = pool.begin().await?;
+    let settings = upsert_ocr_with_provider_tx(
+        &mut tx,
+        workspace_id,
+        base_url,
+        api_key,
+        backend,
+        provider,
+        model,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(settings)
+}
+
+/// API 根据实际保存后的协议验证，然后提交；旧请求省略 provider 也不能绕过验证。
+pub async fn upsert_ocr_with_provider_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace_id: Uuid,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    backend: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> AppResult<LlmSettings> {
     let api_key = secrets::seal_opt(api_key.filter(|key| !key.trim().is_empty()));
     let model = model.map(str::trim);
     let row: LlmSettings = sqlx::query_as(
@@ -149,7 +218,7 @@ pub async fn upsert_ocr_with_provider(
     .bind(backend)
     .bind(provider)
     .bind(model)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await?;
     opened(row)
 }

@@ -2750,18 +2750,18 @@ export const api = {
       },
     ),
 
-  testSettings: (workspaceId: string) =>
+  testSettings: (workspaceId: string, scope?: "chat" | "embed" | "ocr" | "transcribe") =>
     request<{
-      chat: { ok: boolean; reply?: string; error?: string };
-      embed: { ok: boolean; dim?: number; error?: string };
-      ocr?: { ok: boolean; version?: string | null; error?: string };
-      transcribe?: { ok: boolean; error?: string };
-    }>(`/api/v1/workspaces/${workspaceId}/settings/test`, { method: "POST" }),
+      chat?: { ok: boolean; reply?: string; error?: string } | null;
+      embed?: { ok: boolean; dim?: number; error?: string } | null;
+      ocr?: { ok: boolean; version?: string | null; error?: string } | null;
+      transcribe?: { ok: boolean; error?: string } | null;
+    }>(`/api/v1/workspaces/${workspaceId}/settings/test${scope ? `?scope=${scope}` : ""}`, { method: "POST" }),
   /** 读扫描件的服务、转写模型各自一个保存：存它们不碰对话与嵌入那几列。
    *  `requeued`：因为缺它而等着的文件，这一存重新排进了处理队列几份 */
   saveOcrSettings: (
     workspaceId: string,
-    body: { base_url: string; api_key: string; backend: string; provider?: "mineru"; model?: string },
+    body: { base_url: string; api_key: string; backend: string; provider?: "mineru" | "ark"; model?: string },
   ) =>
     request<{ ok: boolean; requeued: number }>(
       `/api/v1/workspaces/${workspaceId}/settings/ocr`,

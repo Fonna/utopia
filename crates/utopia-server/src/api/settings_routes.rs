@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -154,9 +154,13 @@ pub async fn put_ocr(
             .map(String::from)
     };
     let base_url = nonempty(&req.base_url);
-    let provider = implemented_provider(req.provider.as_deref(), "mineru")?;
-    let saved = utopia_store::settings::upsert_ocr_with_provider(
-        &state.pool,
+    let provider = match req.provider.as_deref().map(str::trim) {
+        Some("ark") => Some("ark"),
+        _ => implemented_provider(req.provider.as_deref(), "mineru")?,
+    };
+    let mut tx = state.pool.begin().await?;
+    let saved = utopia_store::settings::upsert_ocr_with_provider_tx(
+        &mut tx,
         workspace_id,
         base_url.as_deref(),
         nonempty(&req.api_key).as_deref(),
@@ -165,6 +169,27 @@ pub async fn put_ocr(
         req.model.as_deref().map(str::trim),
     )
     .await?;
+    // 省略 provider 的旧请求也校验实际保存的协议。事务内决定、校验、提交，
+    // 不先读供应商再写，避免并发保存之间换了协议仍套用旧规则。
+    if saved.ocr_provider == "ark" {
+        crate::readers::ark_ocr::ArkOcr::new(
+            saved
+                .ocr_base_url
+                .as_deref()
+                .unwrap_or("https://ocr-disabled.invalid"),
+            saved.ocr_api_key.as_deref(),
+            saved
+                .ocr_model
+                .as_deref()
+                .filter(|model| !model.is_empty())
+                .unwrap_or("unconfigured"),
+        )
+        .validate()
+        .map_err(|e| {
+            utopia_core::AppError::invalid("bad_ocr_config", e.root_cause().to_string())
+        })?;
+    }
+    tx.commit().await?;
     let mut requeued = 0usize;
     if saved.ocr_ready() {
         let docs =
@@ -245,60 +270,93 @@ fn implemented_provider<'a>(
 }
 
 /// 连通性测试：对话发一条最小消息；embedding 试算一条并返回维度；版面识别服务问一声健康。
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestScope {
+    Chat,
+    Embed,
+    Ocr,
+    Transcribe,
+}
+
+#[derive(Default, Deserialize)]
+pub struct TestSettingsQuery {
+    pub scope: Option<TestScope>,
+}
+
 pub async fn test(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path(workspace_id): Path<Uuid>,
+    Query(query): Query<TestSettingsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     utopia_store::workspaces::require_role(&state.pool, user.id, workspace_id, Role::Admin).await?;
+    let selected = |scope| query.scope.is_none_or(|requested| requested == scope);
     let Some(s) = utopia_store::settings::get(&state.pool, workspace_id).await? else {
-        return Ok(Json(
-            json!({ "chat": { "ok": false, "error": "Not configured" },
-                               "embed": { "ok": false, "error": "Not configured" },
-                               "ocr": { "ok": false, "error": "Not configured" },
-                               "transcribe": { "ok": false, "error": "Not configured" } }),
-        ));
+        let missing =
+            |scope| selected(scope).then(|| json!({ "ok": false, "error": "Not configured" }));
+        return Ok(Json(json!({
+            "chat": missing(TestScope::Chat), "embed": missing(TestScope::Embed),
+            "ocr": missing(TestScope::Ocr), "transcribe": missing(TestScope::Transcribe),
+        })));
     };
 
-    let chat_result = match llm_util::chat_client(&s) {
-        None => json!({ "ok": false, "error": "Not configured" }),
-        Some(client) => {
-            let msg = [ChatMessage {
-                role: "user".into(),
-                content: "Reply with exactly one word: OK".into(),
-            }];
-            match client.chat(&msg).await {
-                Ok(reply) => {
-                    json!({ "ok": true, "reply": reply.chars().take(50).collect::<String>() })
+    // 老客户端省略 scope 仍测试全部；界面逐卡测试，避免无关的付费模型调用。
+    let chat_result = if selected(TestScope::Chat) {
+        Some(match llm_util::chat_client(&s) {
+            None => json!({ "ok": false, "error": "Not configured" }),
+            Some(client) => {
+                let msg = [ChatMessage {
+                    role: "user".into(),
+                    content: "Reply with exactly one word: OK".into(),
+                }];
+                match client.chat(&msg).await {
+                    Ok(reply) => {
+                        json!({ "ok": true, "reply": reply.chars().take(50).collect::<String>() })
+                    }
+                    Err(e) => json!({ "ok": false, "error": e.to_string() }),
                 }
-                Err(e) => json!({ "ok": false, "error": e.to_string() }),
             }
-        }
+        })
+    } else {
+        None
     };
 
-    let embed_result = match llm_util::embed_client(&s) {
-        None => json!({ "ok": false, "error": "Not configured" }),
-        Some(client) => match client.embed(&["connectivity test".to_string()]).await {
-            Ok(v) if !v.is_empty() => json!({ "ok": true, "dim": v[0].len() }),
-            Ok(_) => json!({ "ok": false, "error": "Empty response" }),
-            Err(e) => json!({ "ok": false, "error": e.to_string() }),
-        },
+    let embed_result = if selected(TestScope::Embed) {
+        Some(match llm_util::embed_client(&s) {
+            None => json!({ "ok": false, "error": "Not configured" }),
+            Some(client) => match client.embed(&["connectivity test".to_string()]).await {
+                Ok(v) if !v.is_empty() => json!({ "ok": true, "dim": v[0].len() }),
+                Ok(_) => json!({ "ok": false, "error": "Empty response" }),
+                Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            },
+        })
+    } else {
+        None
     };
 
-    let ocr_result = match crate::readers::Ocr::from_settings(&s) {
-        None => json!({ "ok": false, "error": "Not configured" }),
-        Some(ocr) => match ocr.health().await {
-            Ok(h) => json!({ "ok": true, "version": h["version"] }),
-            Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
-        },
+    let ocr_result = if selected(TestScope::Ocr) {
+        Some(match crate::readers::Ocr::from_settings(&s) {
+            None => json!({ "ok": false, "error": "Not configured" }),
+            Some(ocr) => match ocr.health().await {
+                Ok(h) => json!({ "ok": true, "version": h["version"] }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            },
+        })
+    } else {
+        None
     };
 
-    let transcribe_result = match crate::readers::Transcriber::from_settings(&s) {
-        None => json!({ "ok": false, "error": "Not configured" }),
-        Some(t) => match t.check().await {
-            Ok(()) => json!({ "ok": true }),
-            Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
-        },
+    let transcribe_result = if selected(TestScope::Transcribe) {
+        Some(match crate::readers::Transcriber::from_settings(&s) {
+            None => json!({ "ok": false, "error": "Not configured" }),
+            Some(t) => match t.check().await {
+                Ok(()) => json!({ "ok": true }),
+                Err(e) => json!({ "ok": false, "error": format!("{e:#}") }),
+            },
+        })
+    } else {
+        None
     };
 
     Ok(Json(json!({

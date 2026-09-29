@@ -1317,14 +1317,16 @@ export const en = {
     readersIntro:
       "Scanned PDFs, images and recordings have no text to parse, so each needs its own reader. They are set apart from chat so that sensitive files can stay on your own servers. A file that arrives before its reader waits, and the message center says so; saving the reader reads it.",
     ocrService: "Document reading (OCR)",
+    readerProvider: "Provider",
+    arkProvider: "Ark",
     ocrHint:
-      "A MinerU service (mineru-api). It reads each page's layout first, so every passage keeps its page and position.",
+      "MinerU keeps page and layout positions. Ark transcribes visible text from images and scans with page numbers; it provides no bounding boxes. Check the text against the original.",
     serviceUrl: "Service URL",
     backend: "Backend (optional)",
     transcribeModel: "Transcription",
     transcribeHint:
       "An OpenAI-compatible endpoint that labels speakers (diarized_json), such as gpt-4o-transcribe-diarize. A transcript that cannot say who spoke is not used.",
-    okVersion: (version: string) => `Reachable (MinerU ${version})`,
+    okVersion: (version: string) => `Reachable (${version})`,
     okReachable: "Reachable and authenticated",
     savedRequeued: (n: number) =>
       `Saved. ${n} waiting ${n === 1 ? "file is" : "files are"} being read.`,

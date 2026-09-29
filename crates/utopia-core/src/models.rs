@@ -484,7 +484,15 @@ impl LlmSettings {
         self.embed_base_url.is_some() && self.embed_model.is_some()
     }
     pub fn ocr_ready(&self) -> bool {
-        self.ocr_provider == "mineru" && self.ocr_base_url.is_some()
+        self.ocr_base_url.is_some()
+            && match self.ocr_provider.as_str() {
+                "mineru" => true,
+                "ark" => self
+                    .ocr_model
+                    .as_deref()
+                    .is_some_and(|model| !model.trim().is_empty()),
+                _ => false,
+            }
     }
     pub fn transcribe_ready(&self) -> bool {
         self.transcribe_provider == "openai"

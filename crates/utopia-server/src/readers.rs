@@ -21,6 +21,9 @@ use utopia_ingest::Reading;
 
 use crate::state::AppState;
 
+pub(crate) mod ark_checkpoint;
+pub(crate) mod ark_ocr;
+
 /// 多久问一次。一页扫描件在 GPU 上一两秒，十秒问一次，几十页的文件问几次就好
 const POLL: Duration = Duration::from_secs(10);
 
@@ -36,17 +39,25 @@ pub struct Ocr<'a> {
     base: &'a str,
     key: Option<&'a str>,
     backend: Option<&'a str>,
+    ark: Option<ark_ocr::ArkOcr<'a>>,
 }
 
 impl<'a> Ocr<'a> {
     pub fn from_settings(s: &'a LlmSettings) -> Option<Self> {
-        if s.ocr_provider != "mineru" {
+        if !s.ocr_ready() {
             return None;
         }
         Some(Ocr {
             base: s.ocr_base_url.as_deref()?.trim_end_matches('/'),
             key: s.ocr_api_key.as_deref().filter(|k| !k.is_empty()),
             backend: s.ocr_backend.as_deref().filter(|b| !b.is_empty()),
+            ark: (s.ocr_provider == "ark").then(|| {
+                ark_ocr::ArkOcr::new(
+                    s.ocr_base_url.as_deref().unwrap_or_default(),
+                    s.ocr_api_key.as_deref(),
+                    s.ocr_model.as_deref().unwrap_or_default(),
+                )
+            }),
         })
     }
 
@@ -65,6 +76,9 @@ impl<'a> Ocr<'a> {
 
     /// 连通性测试：服务活着就回它报的版本
     pub async fn health(&self) -> anyhow::Result<Value> {
+        if let Some(ark) = &self.ark {
+            return ark.health().await;
+        }
         let client = crate::query_engine::http()?;
         let resp = self
             .request(&client, reqwest::Method::GET, "health")
@@ -85,6 +99,12 @@ impl<'a> Ocr<'a> {
         doc: &Document,
         bytes: Vec<u8>,
     ) -> anyhow::Result<Reading> {
+        if self.ark.is_some() {
+            return Err(
+                anyhow!("Ark OCR must run through its checkpointed document pipeline")
+                    .context(Terminal),
+            );
+        }
         let pool = &state.pool;
         let stored = utopia_store::documents::reader_task(pool, doc.id).await?;
         let current = stored.as_ref().filter(|t| {

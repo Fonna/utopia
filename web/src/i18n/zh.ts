@@ -1167,13 +1167,15 @@ export const zh: Strings = {
     readersIntro:
       "扫描件、图片和录音没有可以直接解析的文字，各要一个读取模型。它们和对话模型分开配置，敏感文件可以留在自己的服务器上。读取模型配好之前传上来的文件会先等着，消息中心会提示；存好之后自动读。",
     ocrService: "文档识别（OCR）",
-    ocrHint: "MinerU 服务（mineru-api）。先识别每页版面再认字，每段文字都记着所在的页和位置。",
+    readerProvider: "供应商",
+    arkProvider: "火山方舟",
+    ocrHint: "MinerU 保留页码和版面位置；方舟从图片、扫描件抄录可见文字并保留页码，不提供坐标。识别结果请对照原件核查。",
     serviceUrl: "服务地址",
     backend: "后端（可选）",
     transcribeModel: "录音转写",
     transcribeHint:
       "会标注说话人的 OpenAI 兼容转写接口（diarized_json），例如 gpt-4o-transcribe-diarize。分不出谁说的转写不会采用。",
-    okVersion: (version: string) => `已连通（MinerU ${version}）`,
+    okVersion: (version: string) => `已连通（${version}）`,
     okReachable: "已连通，认证通过",
     savedRequeued: (n: number) => `已保存。${n} 个等待中的文件开始读取。`,
   },

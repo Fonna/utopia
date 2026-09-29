@@ -803,7 +803,13 @@ pub async fn list_missing(pool: &PgPool, source_id: Uuid) -> AppResult<Vec<Uuid>
 pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> AppResult<()> {
     // 重新开始处理：上一次缺的读取模型不再算数，读不出来会再记一次
     sqlx::query(
-        "UPDATE documents SET status = $2, error = NULL, reader_needed = NULL, updated_at = now()
+        "UPDATE documents SET status = $2, error = NULL, reader_needed = NULL,
+             reader_task = CASE
+                 WHEN $2 = 'pending' AND reader_task->>'provider' = 'ark'
+                   AND reader_task->>'reader' = 'ocr'
+                 THEN jsonb_set(reader_task, '{run_token}', to_jsonb(gen_random_uuid()::text))
+                 ELSE reader_task END,
+             updated_at = now()
           WHERE id = $1",
     )
     .bind(id)
@@ -815,7 +821,10 @@ pub async fn set_status(pool: &PgPool, id: Uuid, status: &str) -> AppResult<()> 
 
 pub async fn set_failed(pool: &PgPool, id: Uuid, error: &str) -> AppResult<()> {
     sqlx::query(
-        "UPDATE documents SET status = 'failed', error = $2, reader_task = NULL, updated_at = now()
+        "UPDATE documents SET status = 'failed', error = $2,
+             reader_task = CASE WHEN reader_task->>'provider' = 'ark'
+                 AND reader_task->>'reader' = 'ocr' THEN reader_task ELSE NULL END,
+             updated_at = now()
           WHERE id = $1",
     )
     .bind(id)
@@ -829,7 +838,9 @@ pub async fn set_failed(pool: &PgPool, id: Uuid, error: &str) -> AppResult<()> {
 /// 记下缺的是哪一种，配上之后按它重新排队
 pub async fn set_needs_reader(pool: &PgPool, id: Uuid, reader: &str, error: &str) -> AppResult<()> {
     sqlx::query(
-        "UPDATE documents SET status = 'failed', error = $3, reader_needed = $2, reader_task = NULL,
+        "UPDATE documents SET status = 'failed', error = $3, reader_needed = $2,
+             reader_task = CASE WHEN reader_task->>'provider' = 'ark'
+                 AND reader_task->>'reader' = 'ocr' THEN reader_task ELSE NULL END,
                 updated_at = now()
           WHERE id = $1",
     )
@@ -853,7 +864,10 @@ pub async fn requeue_waiting_for_reader(
     let mut tx = pool.begin().await?;
     let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "UPDATE documents d SET status = 'pending', error = NULL, reader_needed = NULL,
-                reader_task = NULL, updated_at = now()
+                reader_task = CASE WHEN reader_task->>'provider' = 'ark'
+                    AND reader_task->>'reader' = 'ocr'
+                    THEN jsonb_set(reader_task, '{run_token}', to_jsonb(gen_random_uuid()::text))
+                    ELSE NULL END, updated_at = now()
            FROM knowledge_bases k
           WHERE k.id = d.kb_id AND k.workspace_id = $1
             AND d.reader_needed = $2 AND d.deleted_at IS NULL
@@ -885,6 +899,197 @@ pub async fn reader_task(pool: &PgPool, id: Uuid) -> AppResult<Option<serde_json
             .await?
             .flatten(),
     )
+}
+
+/// 只供方舟 OCR 使用；其它读取器仍沿用原来的任务和状态规则。
+#[derive(Clone)]
+pub struct ArkOcrSnapshot {
+    pub sha256: String,
+    pub configuration_fingerprint: String,
+    pub task: Option<serde_json::Value>,
+    /// 每轮首次入场核对 Prepared 版本；认领后由完整 task/run_token 继续核验。
+    pub prepared_updated_at: Option<DateTime<Utc>>,
+}
+
+async fn lock_ark_ocr_snapshot_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+) -> AppResult<bool> {
+    let current: Option<(String, Option<serde_json::Value>, DateTime<Utc>, Uuid)> = sqlx::query_as(
+        "SELECT d.sha256, d.reader_task, d.updated_at, k.workspace_id
+         FROM documents d JOIN knowledge_bases k ON k.id = d.kb_id
+         WHERE d.id = $1 AND d.deleted_at IS NULL FOR NO KEY UPDATE OF d",
+    )
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((sha256, task, updated_at, workspace_id)) = current else {
+        return Ok(false);
+    };
+    if sha256 != snapshot.sha256
+        || task != snapshot.task
+        || snapshot
+            .prepared_updated_at
+            .is_some_and(|expected| expected != updated_at)
+    {
+        return Ok(false);
+    }
+    Ok(
+        crate::settings::locked_ocr_configuration_fingerprint(tx, workspace_id)
+            .await?
+            .as_deref()
+            == Some(snapshot.configuration_fingerprint.as_str()),
+    )
+}
+
+/// 在网络调用前认领、在完成页后推进。短事务绑定文件、配置和原任务，失败不清页。
+pub async fn compare_and_set_ark_ocr_task(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    next: &serde_json::Value,
+) -> AppResult<bool> {
+    if next["reader"] != "ocr"
+        || next["provider"] != "ark"
+        || next["sha256"] != snapshot.sha256
+        || next["configuration_fingerprint"] != snapshot.configuration_fingerprint
+    {
+        return Err(AppError::Validation(
+            "Ark OCR checkpoint does not match its input".into(),
+        ));
+    }
+    let mut tx = pool.begin().await?;
+    if !lock_ark_ocr_snapshot_tx(&mut tx, id, snapshot).await? {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE documents SET reader_task = $2, status = 'parsing', error = NULL,
+             reader_needed = NULL, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(next)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub async fn set_ark_ocr_status_if_current(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    status: &str,
+) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    if !lock_ark_ocr_snapshot_tx(&mut tx, id, snapshot).await? {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE documents SET status = $2, updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(status)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Terminal、普通重试、后处理失败都保留已完成页；旧运行不能终结新配置/手动重排。
+pub async fn fail_ark_ocr_if_current(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    error: &str,
+    reader_needed: Option<&str>,
+) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    if !lock_ark_ocr_snapshot_tx(&mut tx, id, snapshot).await? {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE documents SET status = 'failed', error = $2, reader_needed = $3,
+             updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .bind(reader_needed)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub async fn finish_ark_ocr_if_current(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    text_len: i32,
+    chunk_count: i32,
+    graph_status: Option<&str>,
+) -> AppResult<bool> {
+    ready_ark_ocr_if_current(
+        pool,
+        id,
+        snapshot,
+        text_len,
+        chunk_count,
+        true,
+        graph_status,
+    )
+    .await
+}
+
+/// 索引就绪后先允许检索/抽取；检查点保留到来源处理与图谱排队一并提交成功。
+pub async fn set_ark_ocr_ready_if_current(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    text_len: i32,
+    chunk_count: i32,
+) -> AppResult<bool> {
+    ready_ark_ocr_if_current(pool, id, snapshot, text_len, chunk_count, false, None).await
+}
+
+async fn ready_ark_ocr_if_current(
+    pool: &PgPool,
+    id: Uuid,
+    snapshot: &ArkOcrSnapshot,
+    text_len: i32,
+    chunk_count: i32,
+    clear_checkpoint: bool,
+    graph_status: Option<&str>,
+) -> AppResult<bool> {
+    let mut tx = pool.begin().await?;
+    if !lock_ark_ocr_snapshot_tx(&mut tx, id, snapshot).await? {
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE documents SET status = 'ready', error = NULL, reader_needed = NULL,
+             reader_task = CASE WHEN $4 THEN NULL ELSE reader_task END,
+             text_len = $2, chunk_count = $3,
+             graph_status = COALESCE($5, graph_status),
+             graph_error = CASE WHEN $5 IS NOT NULL THEN NULL ELSE graph_error END,
+             updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(text_len)
+    .bind(chunk_count)
+    .bind(clear_checkpoint)
+    .bind(graph_status)
+    .execute(&mut *tx)
+    .await?;
+    if graph_status == Some("queued") {
+        crate::jobs::enqueue_with_max_attempts_tx(
+            &mut tx,
+            "extract_document",
+            serde_json::json!({ "document_id": id }),
+            3,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// 记下刚提交的远端任务。**只在没有任务时记得上**：同一份文档被重复排队、两个处理任务
@@ -1314,7 +1519,7 @@ pub async fn replace_chunks(
     pieces: &[ChunkPiece],
 ) -> AppResult<Vec<(String, String)>> {
     Ok(
-        replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, None)
+        replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, None, None)
             .await?
             .unwrap_or_default(),
     )
@@ -1329,7 +1534,25 @@ pub async fn replace_chunks_if_current(
     pieces: &[ChunkPiece],
     sha256: &str,
 ) -> AppResult<Option<Vec<(String, String)>>> {
-    replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, Some(sha256)).await
+    replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, Some(sha256), None).await
+}
+
+pub async fn replace_ark_ocr_chunks_if_current(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+    pieces: &[ChunkPiece],
+    snapshot: &ArkOcrSnapshot,
+) -> AppResult<Option<Vec<(String, String)>>> {
+    replace_chunks_for_snapshot(
+        pool,
+        kb_id,
+        document_id,
+        pieces,
+        Some(&snapshot.sha256),
+        Some(snapshot),
+    )
+    .await
 }
 
 async fn replace_chunks_for_snapshot(
@@ -1338,6 +1561,7 @@ async fn replace_chunks_for_snapshot(
     document_id: Uuid,
     pieces: &[ChunkPiece],
     sha256: Option<&str>,
+    ark_ocr: Option<&ArkOcrSnapshot>,
 ) -> AppResult<Option<Vec<(String, String)>>> {
     let mut tx = pool.begin().await?;
     // 两个任务可能同时处理同一文档。先锁父记录，即使还没有分块，
@@ -1355,6 +1579,11 @@ async fn replace_chunks_for_snapshot(
     .await?;
     if let Some(expected) = sha256 {
         if !matches!(current, Some((ref sha, false)) if sha == expected) {
+            return Ok(None);
+        }
+    }
+    if let Some(snapshot) = ark_ocr {
+        if !lock_ark_ocr_snapshot_tx(&mut tx, document_id, snapshot).await? {
             return Ok(None);
         }
     }
