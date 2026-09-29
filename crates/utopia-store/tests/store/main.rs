@@ -69,6 +69,7 @@ mod a_purge_is_final;
 mod a_purge_judges_its_blobs_once;
 mod a_qualifier_is_not_the_edges_identity;
 mod a_question_picks_its_definitions;
+mod a_reader_keeps_its_provider_and_key;
 mod a_relation_points_only_inside_its_own_kb;
 mod a_remembered_episode_strips_nul;
 mod a_retired_account;

@@ -40,6 +40,9 @@ pub struct Ocr<'a> {
 
 impl<'a> Ocr<'a> {
     pub fn from_settings(s: &'a LlmSettings) -> Option<Self> {
+        if s.ocr_provider != "mineru" {
+            return None;
+        }
         Some(Ocr {
             base: s.ocr_base_url.as_deref()?.trim_end_matches('/'),
             key: s.ocr_api_key.as_deref().filter(|k| !k.is_empty()),
@@ -232,6 +235,9 @@ pub struct Transcriber<'a> {
 
 impl<'a> Transcriber<'a> {
     pub fn from_settings(s: &'a LlmSettings) -> Option<Self> {
+        if s.transcribe_provider != "openai" {
+            return None;
+        }
         Some(Transcriber {
             base: s.transcribe_base_url.as_deref()?.trim_end_matches('/'),
             key: s.transcribe_api_key.as_deref().filter(|k| !k.is_empty()),

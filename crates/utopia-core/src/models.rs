@@ -462,11 +462,15 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub ocr_api_key: Option<String>,
     pub ocr_backend: Option<String>,
+    /// 协议由供应商决定，不能拿模型名猜；预留值只有在读取器实现后才就绪（0065）。
+    pub ocr_provider: String,
+    pub ocr_model: Option<String>,
     /// 会标说话人的转写模型（OpenAI `/audio/transcriptions` + `diarized_json`，0040）
     pub transcribe_base_url: Option<String>,
     #[serde(skip_serializing)]
     pub transcribe_api_key: Option<String>,
     pub transcribe_model: Option<String>,
+    pub transcribe_provider: String,
     /// 对话模型的推理强度（OpenAI 兼容口的 `reasoning_effort`）：minimal | low | medium | high；
     /// 空 = 不带字段。照原文写 JSON 的任务用 minimal，思考 token 归零、答案不变
     pub chat_reasoning_effort: Option<String>,
@@ -480,10 +484,12 @@ impl LlmSettings {
         self.embed_base_url.is_some() && self.embed_model.is_some()
     }
     pub fn ocr_ready(&self) -> bool {
-        self.ocr_base_url.is_some()
+        self.ocr_provider == "mineru" && self.ocr_base_url.is_some()
     }
     pub fn transcribe_ready(&self) -> bool {
-        self.transcribe_base_url.is_some() && self.transcribe_model.is_some()
+        self.transcribe_provider == "openai"
+            && self.transcribe_base_url.is_some()
+            && self.transcribe_model.is_some()
     }
 }
 

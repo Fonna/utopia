@@ -109,6 +109,7 @@ By domain; the domains are the files of [../design/](../design/README.md). **Sta
 | 0035 | [A vector index is built by a job](0035-a-vector-index-is-built-by-a-job.md) | Implemented |  |
 | 0039 | [A chunk is what extraction sees](0039-a-chunk-is-what-extraction-sees.md) | In progress |  |
 | 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | Implemented |  |
+| 0065 | [Readers choose their provider](0065-readers-choose-their-provider.md) | In progress |  |
 | 0052 | [Document content is a read contract over the retained ledger](0052-document-content-is-a-read-contract.md) | Proposed |  |
 | 0054 | [A source may push statements in the open contract](0054-a-source-may-push-statements-in-the-open-contract.md) | Implemented |  |
 

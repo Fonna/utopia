@@ -107,14 +107,39 @@ pub async fn upsert_ocr(
     api_key: Option<&str>,
     backend: Option<&str>,
 ) -> AppResult<LlmSettings> {
-    let api_key = secrets::seal_opt(api_key);
+    upsert_ocr_with_provider(pool, workspace_id, base_url, api_key, backend, None, None).await
+}
+
+/// 缺席 provider/model 的旧调用保留当前值；显式空 model 清空。
+/// 换协议时，没给的新密钥与模型都清掉。比较留在同一条 SQL 中，不能先读再写（0065）。
+pub async fn upsert_ocr_with_provider(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    backend: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> AppResult<LlmSettings> {
+    let api_key = secrets::seal_opt(api_key.filter(|key| !key.trim().is_empty()));
+    let model = model.map(str::trim);
     let row: LlmSettings = sqlx::query_as(
-        "INSERT INTO llm_settings (workspace_id, ocr_base_url, ocr_api_key, ocr_backend, updated_at)
-         VALUES ($1, $2, $3, $4, now())
+        "INSERT INTO llm_settings
+             (workspace_id, ocr_base_url, ocr_api_key, ocr_backend, ocr_provider, ocr_model, updated_at)
+         VALUES ($1, $2, $3, $4, COALESCE($5, 'mineru'), NULLIF($6, ''), now())
          ON CONFLICT (workspace_id) DO UPDATE SET
              ocr_base_url = EXCLUDED.ocr_base_url,
-             ocr_api_key  = COALESCE(EXCLUDED.ocr_api_key, llm_settings.ocr_api_key),
+             ocr_api_key = CASE
+                 WHEN $5 IS NOT NULL AND $5 <> llm_settings.ocr_provider
+                 THEN EXCLUDED.ocr_api_key
+                 ELSE COALESCE(EXCLUDED.ocr_api_key, llm_settings.ocr_api_key) END,
              ocr_backend  = EXCLUDED.ocr_backend,
+             ocr_provider = COALESCE($5, llm_settings.ocr_provider),
+             ocr_model = CASE
+                 WHEN $5 IS NOT NULL AND $5 <> llm_settings.ocr_provider
+                 THEN EXCLUDED.ocr_model
+                 WHEN $6 IS NULL THEN llm_settings.ocr_model
+                 ELSE EXCLUDED.ocr_model END,
              updated_at   = now()
          RETURNING *",
     )
@@ -122,6 +147,8 @@ pub async fn upsert_ocr(
     .bind(base_url)
     .bind(api_key)
     .bind(backend)
+    .bind(provider)
+    .bind(model)
     .fetch_one(pool)
     .await?;
     opened(row)
@@ -135,15 +162,32 @@ pub async fn upsert_transcribe(
     api_key: Option<&str>,
     model: Option<&str>,
 ) -> AppResult<LlmSettings> {
-    let api_key = secrets::seal_opt(api_key);
+    upsert_transcribe_with_provider(pool, workspace_id, base_url, api_key, model, None).await
+}
+
+/// 转写保留原来的整卡替换语义；只有新增 provider 缺席时保留，切换时的密钥规则与 OCR 一致。
+pub async fn upsert_transcribe_with_provider(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    base_url: Option<&str>,
+    api_key: Option<&str>,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> AppResult<LlmSettings> {
+    let api_key = secrets::seal_opt(api_key.filter(|key| !key.trim().is_empty()));
     let row: LlmSettings = sqlx::query_as(
         "INSERT INTO llm_settings
-             (workspace_id, transcribe_base_url, transcribe_api_key, transcribe_model, updated_at)
-         VALUES ($1, $2, $3, $4, now())
+             (workspace_id, transcribe_base_url, transcribe_api_key, transcribe_model,
+              transcribe_provider, updated_at)
+         VALUES ($1, $2, $3, $4, COALESCE($5, 'openai'), now())
          ON CONFLICT (workspace_id) DO UPDATE SET
              transcribe_base_url = EXCLUDED.transcribe_base_url,
-             transcribe_api_key  = COALESCE(EXCLUDED.transcribe_api_key, llm_settings.transcribe_api_key),
+             transcribe_api_key = CASE
+                 WHEN $5 IS NOT NULL AND $5 <> llm_settings.transcribe_provider
+                 THEN EXCLUDED.transcribe_api_key
+                 ELSE COALESCE(EXCLUDED.transcribe_api_key, llm_settings.transcribe_api_key) END,
              transcribe_model    = EXCLUDED.transcribe_model,
+             transcribe_provider = COALESCE($5, llm_settings.transcribe_provider),
              updated_at          = now()
          RETURNING *",
     )
@@ -151,6 +195,7 @@ pub async fn upsert_transcribe(
     .bind(base_url)
     .bind(api_key)
     .bind(model)
+    .bind(provider)
     .fetch_one(pool)
     .await?;
     opened(row)

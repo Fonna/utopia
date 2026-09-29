@@ -32,9 +32,12 @@ pub async fn get(
             "has_embed_key": s.embed_api_key.as_deref().is_some_and(|k| !k.is_empty()),
             "ocr_base_url": s.ocr_base_url,
             "ocr_backend": s.ocr_backend,
+            "ocr_provider": s.ocr_provider,
+            "ocr_model": s.ocr_model,
             "has_ocr_key": s.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty()),
             "transcribe_base_url": s.transcribe_base_url,
             "transcribe_model": s.transcribe_model,
+            "transcribe_provider": s.transcribe_provider,
             "has_transcribe_key": s.transcribe_api_key.as_deref().is_some_and(|k| !k.is_empty()),
         }),
     }))
@@ -126,6 +129,10 @@ pub struct PutOcrReq {
     /// None 或空串 = 保留旧密钥
     pub api_key: Option<String>,
     pub backend: Option<String>,
+    /// 缺席 = 保留当前协议；预留的协议不代表已经可以调用。
+    pub provider: Option<String>,
+    /// 缺席 = 保留；空串 = 清空；切换协议时不保留原模型。
+    pub model: Option<String>,
 }
 
 /// 版面识别服务（0040 第二刀）。单独一个接口：管理页上它是自己的一张卡片，存它不该把
@@ -147,16 +154,19 @@ pub async fn put_ocr(
             .map(String::from)
     };
     let base_url = nonempty(&req.base_url);
-    utopia_store::settings::upsert_ocr(
+    let provider = implemented_provider(req.provider.as_deref(), "mineru")?;
+    let saved = utopia_store::settings::upsert_ocr_with_provider(
         &state.pool,
         workspace_id,
         base_url.as_deref(),
         nonempty(&req.api_key).as_deref(),
         nonempty(&req.backend).as_deref(),
+        provider,
+        req.model.as_deref().map(str::trim),
     )
     .await?;
     let mut requeued = 0usize;
-    if base_url.is_some() {
+    if saved.ocr_ready() {
         let docs =
             utopia_store::documents::requeue_waiting_for_reader(&state.pool, workspace_id, "ocr")
                 .await?;
@@ -175,6 +185,7 @@ pub struct PutTranscribeReq {
     /// None 或空串 = 保留旧密钥
     pub api_key: Option<String>,
     pub model: Option<String>,
+    pub provider: Option<String>,
 }
 
 /// 转写模型（0040 第三刀）。跟版面识别服务一样单独一个接口；配上的这一刀，这个工作区里
@@ -193,16 +204,18 @@ pub async fn put_transcribe(
             .map(String::from)
     };
     let (base_url, model) = (nonempty(&req.base_url), nonempty(&req.model));
-    utopia_store::settings::upsert_transcribe(
+    let provider = implemented_provider(req.provider.as_deref(), "openai")?;
+    let saved = utopia_store::settings::upsert_transcribe_with_provider(
         &state.pool,
         workspace_id,
         base_url.as_deref(),
         nonempty(&req.api_key).as_deref(),
         model.as_deref(),
+        provider,
     )
     .await?;
     let mut requeued = 0usize;
-    if base_url.is_some() && model.is_some() {
+    if saved.transcribe_ready() {
         let docs = utopia_store::documents::requeue_waiting_for_reader(
             &state.pool,
             workspace_id,
@@ -215,6 +228,20 @@ pub async fn put_transcribe(
         }
     }
     Ok(Json(json!({ "ok": true, "requeued": requeued })))
+}
+
+fn implemented_provider<'a>(
+    requested: Option<&'a str>,
+    implemented: &str,
+) -> utopia_core::AppResult<Option<&'a str>> {
+    let provider = requested.map(str::trim);
+    if provider.is_some_and(|provider| provider != implemented) {
+        return Err(utopia_core::AppError::invalid(
+            "unsupported_reader_provider",
+            "The reader provider is not supported by this server",
+        ));
+    }
+    Ok(provider)
 }
 
 /// 连通性测试：对话发一条最小消息；embedding 试算一条并返回维度；版面识别服务问一声健康。
@@ -281,3 +308,7 @@ pub async fn test(
         "transcribe": transcribe_result,
     })))
 }
+
+#[cfg(test)]
+#[path = "settings_routes_tests.rs"]
+mod tests;
