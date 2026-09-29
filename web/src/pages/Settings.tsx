@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearch } from "@tanstack/react-router";
 import { Plus, X } from "lucide-react";
@@ -30,6 +30,11 @@ import {
   chipLike,} from "../ui";
 import { Members } from "./Members";
 import { SsoAdmin } from "./Sso";
+import {
+  completeOcrSave, editOcrDraft, hasSavedOcrKey, ocrFormFromSettings,
+  resetCompletedOcrSave, isCurrentOcrOperation,
+  switchOcrProvider, syncOcrForm, type OcrDraft, type OcrProvider,
+} from "./ocrSettingsForm";
 
 /** 两张模型卡的备注只讲一件事，且只讲最新的那件（#698）。
  *
@@ -901,9 +906,6 @@ export function Settings() {
     embed_base_url: "",
     embed_api_key: "",
     embed_model: "",
-    ocr_base_url: "",
-    ocr_api_key: "",
-    ocr_backend: "",
     transcribe_base_url: "",
     transcribe_api_key: "",
     transcribe_model: "",
@@ -918,13 +920,25 @@ export function Settings() {
         chat_reasoning_effort: settings.data.chat_reasoning_effort ?? "",
         embed_base_url: settings.data.embed_base_url ?? "",
         embed_model: settings.data.embed_model ?? "",
-        ocr_base_url: settings.data.ocr_base_url ?? "",
-        ocr_backend: settings.data.ocr_backend ?? "",
         transcribe_base_url: settings.data.transcribe_base_url ?? "",
         transcribe_model: settings.data.transcribe_model ?? "",
       }));
     }
   }, [settings.data]);
+
+  const workspaceId = workspace?.id ?? "";
+  // 在 effect 执行前也不显示上个工作区的密钥；A→B→A 同样会使旧保存回调失效。
+  const ocrWorkspace = useRef({ id: workspaceId, generation: 0 });
+  if (ocrWorkspace.current.id !== workspaceId) {
+    ocrWorkspace.current = { id: workspaceId, generation: ocrWorkspace.current.generation + 1 };
+  }
+  const [ocrForm, setOcrForm] = useState(() => ocrFormFromSettings(workspaceId));
+  const currentOcrForm = syncOcrForm(ocrForm, workspaceId, settings.data);
+  const ocr = currentOcrForm.current;
+  const ocrLoaded = !!settings.data;
+  useEffect(() => {
+    setOcrForm((f) => syncOcrForm(f, workspaceId, settings.data));
+  }, [workspaceId, settings.data]);
 
   /** 一张卡一个保存。**PUT 是整体替换**（`llm_settings` 的 upsert 只对两个
       密钥做 COALESCE，其余列直接取 EXCLUDED），所以不能只送这张卡的三项——
@@ -951,15 +965,13 @@ export function Settings() {
   /* 读扫描件的服务、转写模型各有自己的接口：存它们不经过上面那份整体替换，
      所以不用 withSaved 垫底子。回来的 `requeued` 是因为缺它而等着的文件数 */
   const saveOcr = useMutation({
-    mutationFn: () =>
-      api.saveOcrSettings(workspace!.id, {
-        base_url: form.ocr_base_url,
-        api_key: form.ocr_api_key,
-        backend: form.ocr_backend,
-      }),
-    onSuccess: () => {
-      setDirty((d) => ({ ...d, ocr: false }));
-      queryClient.invalidateQueries({ queryKey: ["settings", workspace?.id] });
+    mutationFn: (submitted: { workspaceId: string; generation: number; editRevision: number; draft: OcrDraft }) =>
+      api.saveOcrSettings(submitted.workspaceId, submitted.draft),
+    onSuccess: (_result, submitted) => {
+      if (isCurrentOcrOperation(submitted, ocrWorkspace.current.id, ocrWorkspace.current.generation)) {
+        setOcrForm((f) => completeOcrSave(f, submitted.workspaceId, submitted.draft, submitted.editRevision));
+      }
+      queryClient.invalidateQueries({ queryKey: ["settings", submitted.workspaceId] });
     },
   });
   const saveTranscribe = useMutation({
@@ -977,17 +989,17 @@ export function Settings() {
   const resetSaves = () => {
     saveChat.reset();
     saveEmbed.reset();
-    saveOcr.reset();
+    resetCompletedOcrSave(saveOcr);
     saveTranscribe.reset();
   };
 
   const test = useMutation({
-    mutationFn: () => api.testSettings(workspace!.id),
+    mutationFn: (submitted: { workspaceId: string; generation: number; card: "chat" | "embed" | "ocr" | "transcribe" }) =>
+      api.testSettings(submitted.workspaceId, submitted.card),
     // 测完谁按的就清掉：pending 的字样只在飞行中属于那张卡
     onSettled: () => setTestCard(null),
   });
-  /* 哪张卡按下的"测试"。测一次是两套一起测（一个接口），结果各自回卡；
-     但两个按钮共用这一个 mutation，从前按任意一张两张一起转"Testing…"（#698） */
+  /* 一次只测试按下的卡片，避免测试聊天时额外触发付费的 OCR。 */
   const [testCard, setTestCard] = useState<"chat" | "embed" | "ocr" | "transcribe" | null>(
     null,
   );
@@ -996,14 +1008,13 @@ export function Settings() {
   const [dirty, setDirty] = useState({
     chat: false,
     embed: false,
-    ocr: false,
     transcribe: false,
   });
   /* 开测：上一轮的结论（两边卡的 Saved/报错、上一轮测试结果）全部让位给这一轮 */
-  const startTest = () => {
+  const startTest = (card: "chat" | "embed" | "ocr" | "transcribe") => {
     test.reset();
     resetSaves();
-    test.mutate();
+    test.mutate({ workspaceId, generation: ocrWorkspace.current.generation, card });
   };
 
   if (!workspace)
@@ -1021,12 +1032,22 @@ export function Settings() {
     };
 
   const label = "block text-small font-medium text-ink-2 mb-1";
+  const editOcr = (field: Exclude<keyof OcrDraft, "provider">) =>
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const value = e.target.value;
+      test.reset();
+      resetCompletedOcrSave(saveOcr);
+      setOcrForm((f) => editOcrDraft(syncOcrForm(f, workspaceId, settings.data), field, value));
+    };
 
   /* 两张卡的备注：新测到的盖掉旧保存态，测挂了（连接口都没通）也不再
      悄悄退回"Saved"或空白——从前请求本身失败时卡上什么都不说（#698） */
   const testTransportError = test.error ? (test.error as Error).message : null;
+  const currentOcrSave = isCurrentOcrOperation(saveOcr.variables, workspaceId, ocrWorkspace.current.generation);
+  const currentOcrTest = test.variables?.card === "ocr" &&
+    isCurrentOcrOperation(test.variables, workspaceId, ocrWorkspace.current.generation);
   const chatStatus = modelCardStatus(
-    test.data
+    test.data?.chat
       ? {
           ok: test.data.chat.ok,
           message: test.data.chat.ok
@@ -1034,7 +1055,7 @@ export function Settings() {
             : (test.data.chat.error ?? ""),
         }
       : null,
-    testTransportError,
+    test.variables?.card === "chat" ? testTransportError : null,
     {
       error: saveChat.error ? (saveChat.error as Error).message : null,
       saved: saveChat.isSuccess,
@@ -1042,7 +1063,7 @@ export function Settings() {
     },
   );
   const embedStatus = modelCardStatus(
-    test.data
+    test.data?.embed
       ? {
           ok: test.data.embed.ok,
           message: test.data.embed.ok
@@ -1050,7 +1071,7 @@ export function Settings() {
             : (test.data.embed.error ?? ""),
         }
       : null,
-    testTransportError,
+    test.variables?.card === "embed" ? testTransportError : null,
     {
       error: saveEmbed.error ? (saveEmbed.error as Error).message : null,
       saved: saveEmbed.isSuccess,
@@ -1058,7 +1079,7 @@ export function Settings() {
     },
   );
   const ocrStatus = modelCardStatus(
-    test.data?.ocr
+    currentOcrTest && test.data?.ocr
       ? {
           ok: test.data.ocr.ok,
           message: test.data.ocr.ok
@@ -1066,11 +1087,11 @@ export function Settings() {
             : (test.data.ocr.error ?? ""),
         }
       : null,
-    testTransportError,
+    currentOcrTest ? testTransportError : null,
     {
-      error: saveOcr.error ? (saveOcr.error as Error).message : null,
-      saved: saveOcr.isSuccess,
-      dirty: dirty.ocr,
+      error: currentOcrSave && saveOcr.error ? (saveOcr.error as Error).message : null,
+      saved: currentOcrSave && saveOcr.isSuccess,
+      dirty: currentOcrForm.changed,
     },
   );
   const transcribeStatus = modelCardStatus(
@@ -1082,7 +1103,7 @@ export function Settings() {
             : (test.data.transcribe.error ?? ""),
         }
       : null,
-    testTransportError,
+    test.variables?.card === "transcribe" ? testTransportError : null,
     {
       error: saveTranscribe.error ? (saveTranscribe.error as Error).message : null,
       saved: saveTranscribe.isSuccess,
@@ -1159,7 +1180,7 @@ export function Settings() {
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       setTestCard("chat");
-                      startTest();
+                      startTest("chat");
                     }}
                     disabled={test.isPending || dirty.chat}
                   >
@@ -1254,7 +1275,7 @@ export function Settings() {
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       setTestCard("embed");
-                      startTest();
+                      startTest("embed");
                     }}
                     disabled={test.isPending || dirty.embed}
                   >
@@ -1326,66 +1347,83 @@ export function Settings() {
             <SettingsCard
               title={S.settings.ocrService}
               hint={S.settings.ocrHint}
-              note={readerNote(ocrStatus, saveOcr.data?.requeued)}
+              note={readerNote(ocrStatus, currentOcrSave ? saveOcr.data?.requeued : undefined)}
               action={
                 <>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       setTestCard("ocr");
-                      startTest();
+                      startTest("ocr");
                     }}
-                    disabled={test.isPending || dirty.ocr}
+                    disabled={test.isPending || currentOcrForm.changed || !ocrLoaded}
                   >
-                    {testCard === "ocr" && test.isPending ? S.settings.testing : S.settings.test}
+                    {currentOcrTest && test.isPending ? S.settings.testing : S.settings.test}
                   </Button>
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       test.reset();
-                      saveOcr.mutate();
+                      saveOcr.mutate({ workspaceId, generation: ocrWorkspace.current.generation,
+                        editRevision: currentOcrForm.editRevision, draft: { ...ocr } });
                     }}
-                    disabled={saveOcr.isPending}
+                    disabled={saveOcr.isPending || !ocrLoaded}
                   >
-                    {saveOcr.isPending ? S.settings.saving : S.settings.save}
+                    {currentOcrSave && saveOcr.isPending ? S.settings.saving : S.settings.save}
                   </Button>
                 </>
               }
             >
-              <div className="space-y-3">
+              <fieldset className="space-y-3" disabled={!ocrLoaded}>
+                <div>
+                  <label className={label}>{S.settings.readerProvider}</label>
+                  <Dropdown
+                    value={ocr.provider}
+                    options={[
+                      { value: "mineru", label: "MinerU" },
+                      { value: "ark", label: S.settings.arkProvider },
+                    ]}
+                    onChange={(value) => {
+                      if (!ocrLoaded) return;
+                      test.reset();
+                      resetCompletedOcrSave(saveOcr);
+                      setOcrForm((f) => switchOcrProvider(syncOcrForm(f, workspaceId, settings.data), value as OcrProvider));
+                    }}
+                  />
+                </div>
                 <div>
                   <label className={label}>{S.settings.serviceUrl}</label>
                   <Input
                     className="w-full"
-                    placeholder="http://localhost:8000"
-                    value={form.ocr_base_url}
-                    onChange={set("ocr_base_url")}
+                    placeholder={ocr.provider === "ark" ? "https://ark.cn-beijing.volces.com/api/plan/v3" : "http://localhost:8000"}
+                    value={ocr.base_url}
+                    onChange={editOcr("base_url")}
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
-                    <label className={label}>{S.settings.backend}</label>
+                    <label className={label}>{ocr.provider === "ark" ? S.settings.model : S.settings.backend}</label>
                     <Input
                       className="w-full"
-                      placeholder="vlm-auto-engine"
-                      value={form.ocr_backend}
-                      onChange={set("ocr_backend")}
+                      placeholder={ocr.provider === "ark" ? "doubao-seed-2.1-pro" : "vlm-auto-engine"}
+                      value={ocr.provider === "ark" ? ocr.model : ocr.backend}
+                      onChange={editOcr(ocr.provider === "ark" ? "model" : "backend")}
                     />
                   </div>
                   <div>
                     <label className={label}>
                       {S.settings.apiKey}{" "}
-                      {settings.data?.has_ocr_key && (
+                      {hasSavedOcrKey(ocr, settings.data) && (
                         <span className="text-accent">{S.settings.keyConfigured}</span>
                       )}
                     </label>
                     <Input
                       className="w-full"
                       type="password"
-                      value={form.ocr_api_key}
-                      onChange={set("ocr_api_key")}
+                      value={ocr.api_key}
+                      onChange={editOcr("api_key")}
                     />
                   </div>
                 </div>
-              </div>
+              </fieldset>
             </SettingsCard>
 
             <SettingsCard
@@ -1397,7 +1435,7 @@ export function Settings() {
                   <Button variant="secondary" size="sm"
                     onClick={() => {
                       setTestCard("transcribe");
-                      startTest();
+                      startTest("transcribe");
                     }}
                     disabled={test.isPending || dirty.transcribe}
                   >

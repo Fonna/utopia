@@ -19,6 +19,7 @@ the dead ends behind one sentence of it. Records are cited as [0022]; issues and
 | [governance](governance.md) | Review queues, the governor and its gates, agent decisions, nods, the queue redesign (#725) |
 | [rules](rules.md) | Axioms, business rules, derived facts, proofs, contradictions |
 | [sources](sources.md) | Ingestion, connectors, documents and versions, chunks, media origins (0040), embeddings |
+| [Ark OCR](ark-ocr.md) | Vision reader configuration, input limits, page checkpoints and recovery (0065) |
 | [lakehouse-and-actions](lakehouse-and-actions.md) | Query engines over mounted data, the semantic layer, declared actions |
 | [access-and-audit](access-and-audit.md) | Roles, tokens, credentials, the audit ledger, the export an auditor reads |
 | [interface](interface.md) | Language, theme, alerts, the design rules, what the browse pages show |

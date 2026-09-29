@@ -63,8 +63,10 @@ part); the packer never mixes origins in one chunk; a described block is its own
 breadcrumb and caption. Images and recordings are recognised by header or extension and a PDF with
 an empty text layer is a scan; without the reader the document fails once with `reader_needed` and
 a `document.needs_reader` alert, and saving the setting queues it again [0040]. Scans and images go
-to a workspace's MinerU service (`llm_settings.ocr_*`), one segment per page, the job waiting with
-`Deferred` on the remote task recorded on the document; recordings go to a diarizing transcription
+to the workspace's selected OCR provider (`llm_settings.ocr_*`). MinerU returns one segment per
+page while the job waits with `Deferred` on its remote task; [Ark OCR](ark-ocr.md) sends original
+image bytes or a rendered PDF page and checkpoints completed pages, keeping page numbers without
+bounding boxes [0065]. Recordings go to a diarizing transcription
 model (`transcribe_*`) and a transcript without speaker labels is refused; speakers are written into
 the text as turns [0040 cuts 2 and 3]. Facts from a described chunk enter below the auto-close
 threshold [0040 d4].

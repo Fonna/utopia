@@ -29,6 +29,9 @@ use wiremock::{
     matchers::method, matchers::path, Mock, MockServer, Request, Respond, ResponseTemplate,
 };
 
+#[path = "pipeline_ark_tests.rs"]
+mod ark_tests;
+
 /// 正文 → 向量：长度、首字符、字节和取模、常数 1。四维就够分辨每一条
 fn vector_of(text: &str) -> Vec<f32> {
     vec![
