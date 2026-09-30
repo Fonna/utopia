@@ -111,6 +111,7 @@ By domain; the domains are the files of [../design/](../design/README.md). **Sta
 | 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | Implemented |  |
 | 0052 | [Document content is a read contract over the retained ledger](0052-document-content-is-a-read-contract.md) | Proposed |  |
 | 0054 | [A source may push statements in the open contract](0054-a-source-may-push-statements-in-the-open-contract.md) | Implemented |  |
+| 0065 | [The OCR reader chooses its provider](0065-readers-choose-their-provider.md) | Implemented |  |
 
 ### [lakehouse-and-actions](../design/lakehouse-and-actions.md)
 

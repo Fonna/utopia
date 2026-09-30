@@ -462,6 +462,11 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub ocr_api_key: Option<String>,
     pub ocr_backend: Option<String>,
+    /// 读扫描件的服务是哪一种协议（0065）：`mineru` 交任务再问，`ark` 把每页送给视觉模型。
+    /// 已有的行默认 `mineru`
+    pub ocr_provider: String,
+    /// 方舟那一路的视觉模型名；MinerU 用不到
+    pub ocr_model: Option<String>,
     /// 会标说话人的转写模型（OpenAI `/audio/transcriptions` + `diarized_json`，0040）
     pub transcribe_base_url: Option<String>,
     #[serde(skip_serializing)]
@@ -479,8 +484,19 @@ impl LlmSettings {
     pub fn embed_ready(&self) -> bool {
         self.embed_base_url.is_some() && self.embed_model.is_some()
     }
+    /// MinerU 有地址就够；方舟还要模型名和密钥（它是收费的模型接口）
     pub fn ocr_ready(&self) -> bool {
         self.ocr_base_url.is_some()
+            && match self.ocr_provider.as_str() {
+                "mineru" => true,
+                "ark" => {
+                    self.ocr_model
+                        .as_deref()
+                        .is_some_and(|m| !m.trim().is_empty())
+                        && self.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty())
+                }
+                _ => false,
+            }
     }
     pub fn transcribe_ready(&self) -> bool {
         self.transcribe_base_url.is_some() && self.transcribe_model.is_some()

@@ -1319,12 +1319,16 @@ export const en = {
     ocrService: "Document reading (OCR)",
     ocrHint:
       "A MinerU service (mineru-api). It reads each page's layout first, so every passage keeps its page and position.",
+    ocrHintArk:
+      "A Volcengine Ark vision model reads each page and returns only the written text. Passages keep their page; there are no positions. Every page is a paid model call.",
+    readerProvider: "Provider",
+    arkProvider: "Volcengine Ark",
     serviceUrl: "Service URL",
     backend: "Backend (optional)",
     transcribeModel: "Transcription",
     transcribeHint:
       "An OpenAI-compatible endpoint that labels speakers (diarized_json), such as gpt-4o-transcribe-diarize. A transcript that cannot say who spoke is not used.",
-    okVersion: (version: string) => `Reachable (MinerU ${version})`,
+    okVersion: (version: string) => `Reachable (${version})`,
     okReachable: "Reachable and authenticated",
     savedRequeued: (n: number) =>
       `Saved. ${n} waiting ${n === 1 ? "file is" : "files are"} being read.`,

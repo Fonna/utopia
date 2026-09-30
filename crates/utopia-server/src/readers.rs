@@ -21,6 +21,8 @@ use utopia_ingest::Reading;
 
 use crate::state::AppState;
 
+pub mod ark_ocr;
+
 /// 多久问一次。一页扫描件在 GPU 上一两秒，十秒问一次，几十页的文件问几次就好
 const POLL: Duration = Duration::from_secs(10);
 
@@ -31,19 +33,34 @@ const PATIENCE_HOURS: i64 = 6;
 /// 传文件、取结果的超时。共用客户端的 20 秒是给探针和小请求的，一份几十兆的扫描件传不完
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// 工作区配的版面识别服务
+/// 工作区配的读字服务：MinerU（下面这一整套交任务再问的流程），或方舟的视觉模型
+/// （`ark_ocr`，一次读完，0065）。两条路出来的是同一个 `Reading`
 pub struct Ocr<'a> {
     base: &'a str,
     key: Option<&'a str>,
     backend: Option<&'a str>,
+    ark: Option<ark_ocr::ArkOcr<'a>>,
 }
 
 impl<'a> Ocr<'a> {
     pub fn from_settings(s: &'a LlmSettings) -> Option<Self> {
+        if !s.ocr_ready() {
+            return None;
+        }
+        let key = s.ocr_api_key.as_deref().filter(|k| !k.is_empty());
+        let base = s.ocr_base_url.as_deref()?.trim_end_matches('/');
         Some(Ocr {
-            base: s.ocr_base_url.as_deref()?.trim_end_matches('/'),
-            key: s.ocr_api_key.as_deref().filter(|k| !k.is_empty()),
+            base,
+            key,
             backend: s.ocr_backend.as_deref().filter(|b| !b.is_empty()),
+            // ocr_ready 已经保证方舟这一路有模型和密钥
+            ark: (s.ocr_provider == "ark").then(|| {
+                ark_ocr::ArkOcr::new(
+                    base,
+                    key.unwrap_or_default(),
+                    s.ocr_model.as_deref().unwrap_or_default(),
+                )
+            }),
         })
     }
 
@@ -62,6 +79,9 @@ impl<'a> Ocr<'a> {
 
     /// 连通性测试：服务活着就回它报的版本
     pub async fn health(&self) -> anyhow::Result<Value> {
+        if let Some(ark) = &self.ark {
+            return ark.health().await;
+        }
         let client = crate::query_engine::http()?;
         let resp = self
             .request(&client, reqwest::Method::GET, "health")
@@ -72,7 +92,8 @@ impl<'a> Ocr<'a> {
         if !status.is_success() {
             return Err(anyhow!("the OCR service answered {status}"));
         }
-        Ok(resp.json().await.unwrap_or(Value::Null))
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        Ok(json!({ "version": format!("MinerU {}", jstr(&v["version"])).trim().to_string() }))
     }
 
     /// 读这份文件。没读完返回挂着 `Deferred` 的错误，调用方原样往上抛
@@ -82,6 +103,9 @@ impl<'a> Ocr<'a> {
         doc: &Document,
         bytes: Vec<u8>,
     ) -> anyhow::Result<Reading> {
+        if let Some(ark) = &self.ark {
+            return ark.read(&bytes).await;
+        }
         let pool = &state.pool;
         let stored = utopia_store::documents::reader_task(pool, doc.id).await?;
         let current = stored.as_ref().filter(|t| {

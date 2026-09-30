@@ -901,9 +901,11 @@ export function Settings() {
     embed_base_url: "",
     embed_api_key: "",
     embed_model: "",
+    ocr_provider: "mineru",
     ocr_base_url: "",
     ocr_api_key: "",
     ocr_backend: "",
+    ocr_model: "",
     transcribe_base_url: "",
     transcribe_api_key: "",
     transcribe_model: "",
@@ -918,8 +920,10 @@ export function Settings() {
         chat_reasoning_effort: settings.data.chat_reasoning_effort ?? "",
         embed_base_url: settings.data.embed_base_url ?? "",
         embed_model: settings.data.embed_model ?? "",
+        ocr_provider: settings.data.ocr_provider ?? "mineru",
         ocr_base_url: settings.data.ocr_base_url ?? "",
         ocr_backend: settings.data.ocr_backend ?? "",
+        ocr_model: settings.data.ocr_model ?? "",
         transcribe_base_url: settings.data.transcribe_base_url ?? "",
         transcribe_model: settings.data.transcribe_model ?? "",
       }));
@@ -953,9 +957,11 @@ export function Settings() {
   const saveOcr = useMutation({
     mutationFn: () =>
       api.saveOcrSettings(workspace!.id, {
+        provider: form.ocr_provider,
         base_url: form.ocr_base_url,
         api_key: form.ocr_api_key,
         backend: form.ocr_backend,
+        model: form.ocr_model,
       }),
     onSuccess: () => {
       setDirty((d) => ({ ...d, ocr: false }));
@@ -1325,7 +1331,7 @@ export function Settings() {
 
             <SettingsCard
               title={S.settings.ocrService}
-              hint={S.settings.ocrHint}
+              hint={form.ocr_provider === "ark" ? S.settings.ocrHintArk : S.settings.ocrHint}
               note={readerNote(ocrStatus, saveOcr.data?.requeued)}
               action={
                 <>
@@ -1351,29 +1357,62 @@ export function Settings() {
               }
             >
               <div className="space-y-3">
+                {/* 两种协议（0065）：MinerU 交任务再问，方舟把每页送给视觉模型。换一种就是换一家
+                    服务，地址、密钥、模型都不通用，所以切换时整张卡清空重填；服务端也不会把
+                    旧密钥带到新供应商 */}
+                <div>
+                  <label className={label}>{S.settings.readerProvider}</label>
+                  <Dropdown
+                    className="w-full"
+                    value={form.ocr_provider}
+                    onChange={(v) => {
+                      if (v === form.ocr_provider) return;
+                      test.reset();
+                      resetSaves();
+                      setDirty((d) => ({ ...d, ocr: true }));
+                      setForm({ ...form, ocr_provider: v, ocr_base_url: "", ocr_api_key: "", ocr_backend: "", ocr_model: "" });
+                    }}
+                    options={[
+                      { value: "mineru", label: "MinerU" },
+                      { value: "ark", label: S.settings.arkProvider },
+                    ]}
+                  />
+                </div>
                 <div>
                   <label className={label}>{S.settings.serviceUrl}</label>
                   <Input
                     className="w-full"
-                    placeholder="http://localhost:8000"
+                    placeholder={form.ocr_provider === "ark" ? "https://ark.cn-beijing.volces.com/api/v3" : "http://localhost:8000"}
                     value={form.ocr_base_url}
                     onChange={set("ocr_base_url")}
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className={label}>{S.settings.backend}</label>
-                    <Input
-                      className="w-full"
-                      placeholder="vlm-auto-engine"
-                      value={form.ocr_backend}
-                      onChange={set("ocr_backend")}
-                    />
-                  </div>
+                  {form.ocr_provider === "ark" ? (
+                    <div>
+                      <label className={label}>{S.settings.model}</label>
+                      <Input
+                        className="w-full"
+                        placeholder="doubao-seed-2.1-pro"
+                        value={form.ocr_model}
+                        onChange={set("ocr_model")}
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <label className={label}>{S.settings.backend}</label>
+                      <Input
+                        className="w-full"
+                        placeholder="vlm-auto-engine"
+                        value={form.ocr_backend}
+                        onChange={set("ocr_backend")}
+                      />
+                    </div>
+                  )}
                   <div>
                     <label className={label}>
                       {S.settings.apiKey}{" "}
-                      {settings.data?.has_ocr_key && (
+                      {settings.data?.has_ocr_key && settings.data.ocr_provider === form.ocr_provider && (
                         <span className="text-accent">{S.settings.keyConfigured}</span>
                       )}
                     </label>

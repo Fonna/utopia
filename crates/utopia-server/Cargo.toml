@@ -36,6 +36,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 flate2.workspace = true
 reqwest.workspace = true
+# 方舟 OCR 把 PDF 写到临时目录给 Poppler 渲染（readers/ark_ocr.rs）
+tempfile.workspace = true
 
 feed-rs.workspace = true
 async-trait = "0.1.92"
@@ -55,4 +57,3 @@ rig-core = { version = "0.42", default-features = false }
 wiremock = "0.6.5"
 # 静态托管那一段的单测：不连库地把请求推进 Router
 tower = { version = "0.5", features = ["util"] }
-tempfile.workspace = true

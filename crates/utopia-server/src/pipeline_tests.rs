@@ -486,9 +486,11 @@ async fn with_mineru(f: &Fx, fake: &FakeMineru) -> anyhow::Result<()> {
     utopia_store::settings::upsert_ocr(
         &f.pool,
         f.ws,
+        "mineru",
         Some(&format!("{}/ocr/", f.server.uri())),
         Some("ocr-secret"),
         Some("vlm-auto-engine"),
+        None,
     )
     .await?;
     Ok(())
@@ -596,6 +598,83 @@ async fn a_scan_waits_for_the_layout_service_and_keeps_its_page() -> anyhow::Res
         f.stored(doc).await?.iter().all(|(_, v)| v.is_some()),
         "embedded like any text"
     );
+    f.cleanup().await
+}
+
+/// 方舟那一路（0065）：图片整张送给视觉模型，一次读完；一页限流了在本轮里退避重试，不烧
+/// 文档的重试预算；换成方舟之后 MinerU 那套任务号一个都不记
+#[tokio::test]
+async fn a_scan_is_read_by_the_vision_model_in_one_pass() -> anyhow::Result<()> {
+    let Some(f) = fixture(FakeEmbed::new(Duration::from_millis(5))).await? else {
+        return Ok(());
+    };
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/ark/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let mut calls = seen.lock().expect("lock");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            calls.push(format!(
+                "{} {} {}",
+                request.headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default(),
+                body["model"],
+                body["messages"][1]["content"][1]["image_url"]["url"].as_str().unwrap_or_default().chars().take(22).collect::<String>()
+            ));
+            if calls.len() == 1 {
+                // 第一次限流：本轮里退避后再来，不是文档失败
+                return ResponseTemplate::new(429);
+            }
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{ "finish_reason": "stop", "message": { "role": "assistant",
+                    "content": "{\"text\":\"Lease Agreement\\n\\nBeta Robotics pays Alpha 1,000 per month.\"}" } }]
+            }))
+        })
+        .mount(&f.server)
+        .await;
+    utopia_store::settings::upsert_ocr(
+        &f.pool,
+        f.ws,
+        "ark",
+        Some(&format!("{}/ark", f.server.uri())),
+        Some("ark-secret"),
+        None,
+        Some("doubao-seed-2.1-pro"),
+    )
+    .await?;
+    let png = [
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0x0D, b'I', b'H',
+    ];
+    let doc = f.document_with_bytes("contract-scan.png", &png).await?;
+    // 退避在测试构建里是毫秒级（`ark_ocr::BACKOFF`）
+    super::process_document(&f.state, doc).await?;
+    let row = utopia_store::documents::get(&f.pool, doc).await?;
+    assert_eq!(row.status, "ready", "{:?}", row.error);
+    assert_eq!(
+        reader_task(&f, doc).await?,
+        None,
+        "no remote task to remember"
+    );
+    let calls = calls.lock().expect("lock").clone();
+    assert_eq!(calls.len(), 2, "one 429, then the page: {calls:?}");
+    assert_eq!(
+        calls[1],
+        "Bearer ark-secret \"doubao-seed-2.1-pro\" data:image/png;base64,"
+    );
+
+    type Stored = (String, String, Option<String>, Option<serde_json::Value>);
+    let chunks: Vec<Stored> = sqlx::query_as(
+        "SELECT text, origin, origin_model, anchor FROM chunks
+          WHERE document_id = $1 AND superseded_at IS NULL ORDER BY seq",
+    )
+    .bind(doc)
+    .fetch_all(&f.pool)
+    .await?;
+    assert_eq!(chunks.len(), 1, "{chunks:#?}");
+    assert_eq!(chunks[0].1, "ocr");
+    assert_eq!(chunks[0].2.as_deref(), Some("ark doubao-seed-2.1-pro"));
+    assert!(chunks[0].0.contains("1,000 per month"));
+    assert_eq!(chunks[0].3, Some(serde_json::json!({ "page": 1 })));
     f.cleanup().await
 }
 

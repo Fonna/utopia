@@ -289,8 +289,11 @@ export interface LlmSettingsView {
   embed_model?: string | null;
   embed_dim?: number | null;
   has_embed_key?: boolean;
+  /** mineru | ark（0065） */
+  ocr_provider?: string;
   ocr_base_url?: string | null;
   ocr_backend?: string | null;
+  ocr_model?: string | null;
   has_ocr_key?: boolean;
   transcribe_base_url?: string | null;
   transcribe_model?: string | null;
@@ -2758,7 +2761,7 @@ export const api = {
    *  `requeued`：因为缺它而等着的文件，这一存重新排进了处理队列几份 */
   saveOcrSettings: (
     workspaceId: string,
-    body: { base_url: string; api_key: string; backend: string },
+    body: { provider: string; base_url: string; api_key: string; backend: string; model: string },
   ) =>
     request<{ ok: boolean; requeued: number }>(
       `/api/v1/workspaces/${workspaceId}/settings/ocr`,

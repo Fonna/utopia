@@ -30,8 +30,10 @@ pub async fn get(
             "embed_model": s.embed_model,
             "embed_dim": s.embed_dim,
             "has_embed_key": s.embed_api_key.as_deref().is_some_and(|k| !k.is_empty()),
+            "ocr_provider": s.ocr_provider,
             "ocr_base_url": s.ocr_base_url,
             "ocr_backend": s.ocr_backend,
+            "ocr_model": s.ocr_model,
             "has_ocr_key": s.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty()),
             "transcribe_base_url": s.transcribe_base_url,
             "transcribe_model": s.transcribe_model,
@@ -121,11 +123,15 @@ pub async fn put(
 
 #[derive(Deserialize)]
 pub struct PutOcrReq {
+    /// `mineru`（缺席也是它，老客户端不带这个字段）或 `ark`（0065）
+    pub provider: Option<String>,
     /// 空 = 关掉：扫描件、图片照第一刀降级
     pub base_url: Option<String>,
-    /// None 或空串 = 保留旧密钥
+    /// None 或空串 = 保留旧密钥；换供应商时不保留
     pub api_key: Option<String>,
     pub backend: Option<String>,
+    /// 方舟的视觉模型名；MinerU 忽略
+    pub model: Option<String>,
 }
 
 /// 版面识别服务（0040 第二刀）。单独一个接口：管理页上它是自己的一张卡片，存它不该把
@@ -146,17 +152,27 @@ pub async fn put_ocr(
             .filter(|s| !s.is_empty())
             .map(String::from)
     };
+    let provider = nonempty(&req.provider).unwrap_or_else(|| "mineru".into());
+    if !matches!(provider.as_str(), "mineru" | "ark") {
+        return Err(utopia_core::AppError::invalid(
+            "unsupported_reader_provider",
+            "The OCR provider must be mineru or ark",
+        )
+        .into());
+    }
     let base_url = nonempty(&req.base_url);
-    utopia_store::settings::upsert_ocr(
+    let saved = utopia_store::settings::upsert_ocr(
         &state.pool,
         workspace_id,
+        &provider,
         base_url.as_deref(),
         nonempty(&req.api_key).as_deref(),
         nonempty(&req.backend).as_deref(),
+        nonempty(&req.model).as_deref(),
     )
     .await?;
     let mut requeued = 0usize;
-    if base_url.is_some() {
+    if saved.ocr_ready() {
         let docs =
             utopia_store::documents::requeue_waiting_for_reader(&state.pool, workspace_id, "ocr")
                 .await?;
