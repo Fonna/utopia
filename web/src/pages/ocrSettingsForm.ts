@@ -104,7 +104,7 @@ export function hasSavedOcrKey(draft: OcrDraft, saved?: LlmSettingsView): boolea
     endpoint(draft.base_url) === endpoint(saved.ocr_base_url ?? "");
 }
 
-// 请求完成时可能已换工作区或继续编辑；只清理确实保存了的那一份密钥。
+// 请求完成时可能已换工作区或继续编辑；仅在表单未变化时清空当前密钥和所有旧草稿。
 export function completeOcrSave(form: OcrForm, workspaceId: string, submitted: OcrDraft, editRevision: number): OcrForm {
   if (form.workspaceId !== workspaceId || form.editRevision !== editRevision ||
       JSON.stringify(form.current) !== JSON.stringify(submitted)) return form;

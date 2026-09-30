@@ -470,7 +470,6 @@ pub struct LlmSettings {
     #[serde(skip_serializing)]
     pub transcribe_api_key: Option<String>,
     pub transcribe_model: Option<String>,
-    pub transcribe_provider: String,
     /// 对话模型的推理强度（OpenAI 兼容口的 `reasoning_effort`）：minimal | low | medium | high；
     /// 空 = 不带字段。照原文写 JSON 的任务用 minimal，思考 token 归零、答案不变
     pub chat_reasoning_effort: Option<String>,
@@ -495,9 +494,7 @@ impl LlmSettings {
             }
     }
     pub fn transcribe_ready(&self) -> bool {
-        self.transcribe_provider == "openai"
-            && self.transcribe_base_url.is_some()
-            && self.transcribe_model.is_some()
+        self.transcribe_base_url.is_some() && self.transcribe_model.is_some()
     }
 }
 

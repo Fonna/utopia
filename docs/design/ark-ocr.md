@@ -2,8 +2,7 @@
 
 Records: [0065](../decisions/0065-readers-choose-their-provider.md) (provider selection and
 recovery), [0040](../decisions/0040-a-chunk-says-where-its-words-came-from.md) (origin and
-evidence). This guide covers the Ark OCR implementation in the second provider change; merge
-the provider settings change first, then the OCR change.
+evidence). The same change adds the OCR provider settings and the Ark reader.
 
 ## Configure a workspace
 
@@ -26,7 +25,9 @@ you enter a replacement. If you change the endpoint while keeping the same provi
 the key for the new endpoint: a blank input still retains the stored key. Each provider keeps
 its own unsaved form draft; switching back restores the edited address and options. Defaults
 apply only to a fresh draft, and the saved-key indicator belongs to the saved provider and
-endpoint. Saving successfully or changing workspace clears the relevant drafts and key input.
+endpoint. Changing workspace clears drafts and key input. A successful save clears all
+previous drafts and the current key input if no edits occurred after submission; later
+edits remain.
 
 Save before using **Test**. The test sends a valid, blank 32 × 32 PNG and verifies that the
 endpoint returns the complete text JSON protocol. This is a model request and can consume
@@ -61,8 +62,8 @@ format validation: compressed image data and checksums are left to the receiving
 
 PDFs use `pdfinfo` to count pages and the existing Poppler tools to render each page. The
 application does not decode those PNGs locally. The Docker runtime already includes Poppler
-and its CJK data; a local deployment needs `pdfinfo` and `pdftoppm` on `PATH`. No `image`,
-`tokio-tungstenite` or FFmpeg dependency is added for this reader.
+and its CJK data; a local deployment needs `pdfinfo` and `pdftoppm` on `PATH`. No image-decoding
+dependency is added for this reader.
 
 ## Reading and evidence
 
@@ -117,18 +118,3 @@ A request may succeed remotely and consume quota before its page is persisted lo
 process stops in that interval, the in-flight page may be requested again. Persisted completed
 pages are reused, but the provider supplies no remote idempotency guarantee here, so the reader
 does not promise exactly-once requests or charges.
-
-## Scope and development baseline
-
-Ark audio transcription is deferred. The documented Agent Plan ASR routes are WebSocket
-routes, including the route named `bigmodel_nostream`. The ordinary HTTP file-recognition
-service has different routes and credential/resource requirements; official evidence has not
-established that it accepts the plan's dedicated key or uses its subscription entitlement.
-See the [Agent Plan voice documentation](https://www.volcengine.com/docs/82379/2516286?lang=zh)
-and [HTTP file-recognition documentation](https://www.volcengine.com/docs/6561/1354868?lang=zh).
-There is no Ark transcription choice in these changes.
-
-The OCR change does not update `Cargo.lock` or the toolchain policy. The existing lockfile
-already selects `calamine 0.36.1` and `jsonwebtoken 10.4.0`, whose published manifests require
-Rust 1.88. The README's older Rust 1.85 statement predates this change; that baseline mismatch
-is separate from adding OCR.

@@ -492,6 +492,8 @@ async fn with_mineru(f: &Fx, fake: &FakeMineru) -> anyhow::Result<()> {
         Some(&format!("{}/ocr/", f.server.uri())),
         Some("ocr-secret"),
         Some("vlm-auto-engine"),
+        None,
+        None,
     )
     .await?;
     Ok(())

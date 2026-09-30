@@ -296,7 +296,6 @@ export interface LlmSettingsView {
   has_ocr_key?: boolean;
   transcribe_base_url?: string | null;
   transcribe_model?: string | null;
-  transcribe_provider?: string;
   has_transcribe_key?: boolean;
 }
 
@@ -2769,7 +2768,7 @@ export const api = {
     ),
   saveTranscribeSettings: (
     workspaceId: string,
-    body: { base_url: string; api_key: string; model: string; provider?: "openai" },
+    body: { base_url: string; api_key: string; model: string },
   ) =>
     request<{ ok: boolean; requeued: number }>(
       `/api/v1/workspaces/${workspaceId}/settings/transcribe`,

@@ -37,7 +37,6 @@ pub async fn get(
             "has_ocr_key": s.ocr_api_key.as_deref().is_some_and(|k| !k.is_empty()),
             "transcribe_base_url": s.transcribe_base_url,
             "transcribe_model": s.transcribe_model,
-            "transcribe_provider": s.transcribe_provider,
             "has_transcribe_key": s.transcribe_api_key.as_deref().is_some_and(|k| !k.is_empty()),
         }),
     }))
@@ -129,7 +128,7 @@ pub struct PutOcrReq {
     /// None 或空串 = 保留旧密钥
     pub api_key: Option<String>,
     pub backend: Option<String>,
-    /// 缺席 = 保留当前协议；预留的协议不代表已经可以调用。
+    /// 缺席 = 保留当前协议；只接受已实现的供应商。
     pub provider: Option<String>,
     /// 缺席 = 保留；空串 = 清空；切换协议时不保留原模型。
     pub model: Option<String>,
@@ -159,7 +158,7 @@ pub async fn put_ocr(
         _ => implemented_provider(req.provider.as_deref(), "mineru")?,
     };
     let mut tx = state.pool.begin().await?;
-    let saved = utopia_store::settings::upsert_ocr_with_provider_tx(
+    let saved = utopia_store::settings::upsert_ocr_tx(
         &mut tx,
         workspace_id,
         base_url.as_deref(),
@@ -210,7 +209,6 @@ pub struct PutTranscribeReq {
     /// None 或空串 = 保留旧密钥
     pub api_key: Option<String>,
     pub model: Option<String>,
-    pub provider: Option<String>,
 }
 
 /// 转写模型（0040 第三刀）。跟版面识别服务一样单独一个接口；配上的这一刀，这个工作区里
@@ -229,18 +227,16 @@ pub async fn put_transcribe(
             .map(String::from)
     };
     let (base_url, model) = (nonempty(&req.base_url), nonempty(&req.model));
-    let provider = implemented_provider(req.provider.as_deref(), "openai")?;
-    let saved = utopia_store::settings::upsert_transcribe_with_provider(
+    utopia_store::settings::upsert_transcribe(
         &state.pool,
         workspace_id,
         base_url.as_deref(),
         nonempty(&req.api_key).as_deref(),
         model.as_deref(),
-        provider,
     )
     .await?;
     let mut requeued = 0usize;
-    if saved.transcribe_ready() {
+    if base_url.is_some() && model.is_some() {
         let docs = utopia_store::documents::requeue_waiting_for_reader(
             &state.pool,
             workspace_id,

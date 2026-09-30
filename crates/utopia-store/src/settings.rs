@@ -144,19 +144,9 @@ pub async fn set_chat_reasoning_effort(
 
 /// 版面识别服务的设置，单独存：它在管理页上是自己的一张卡片，存它不该碰对话和嵌入那几列
 /// （反过来也一样——`upsert` 不写这三列）。`api_key` 传 None 保留旧值；地址传 None = 关掉
-pub async fn upsert_ocr(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    backend: Option<&str>,
-) -> AppResult<LlmSettings> {
-    upsert_ocr_with_provider(pool, workspace_id, base_url, api_key, backend, None, None).await
-}
-
 /// 缺席 provider/model 的旧调用保留当前值；显式空 model 清空。
 /// 换协议时，没给的新密钥与模型都清掉。比较留在同一条 SQL 中，不能先读再写（0065）。
-pub async fn upsert_ocr_with_provider(
+pub async fn upsert_ocr(
     pool: &PgPool,
     workspace_id: Uuid,
     base_url: Option<&str>,
@@ -166,7 +156,7 @@ pub async fn upsert_ocr_with_provider(
     model: Option<&str>,
 ) -> AppResult<LlmSettings> {
     let mut tx = pool.begin().await?;
-    let settings = upsert_ocr_with_provider_tx(
+    let settings = upsert_ocr_tx(
         &mut tx,
         workspace_id,
         base_url,
@@ -181,7 +171,7 @@ pub async fn upsert_ocr_with_provider(
 }
 
 /// API 根据实际保存后的协议验证，然后提交；旧请求省略 provider 也不能绕过验证。
-pub async fn upsert_ocr_with_provider_tx(
+pub async fn upsert_ocr_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     workspace_id: Uuid,
     base_url: Option<&str>,
@@ -231,32 +221,15 @@ pub async fn upsert_transcribe(
     api_key: Option<&str>,
     model: Option<&str>,
 ) -> AppResult<LlmSettings> {
-    upsert_transcribe_with_provider(pool, workspace_id, base_url, api_key, model, None).await
-}
-
-/// 转写保留原来的整卡替换语义；只有新增 provider 缺席时保留，切换时的密钥规则与 OCR 一致。
-pub async fn upsert_transcribe_with_provider(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    base_url: Option<&str>,
-    api_key: Option<&str>,
-    model: Option<&str>,
-    provider: Option<&str>,
-) -> AppResult<LlmSettings> {
-    let api_key = secrets::seal_opt(api_key.filter(|key| !key.trim().is_empty()));
+    let api_key = secrets::seal_opt(api_key);
     let row: LlmSettings = sqlx::query_as(
         "INSERT INTO llm_settings
-             (workspace_id, transcribe_base_url, transcribe_api_key, transcribe_model,
-              transcribe_provider, updated_at)
-         VALUES ($1, $2, $3, $4, COALESCE($5, 'openai'), now())
+             (workspace_id, transcribe_base_url, transcribe_api_key, transcribe_model, updated_at)
+         VALUES ($1, $2, $3, $4, now())
          ON CONFLICT (workspace_id) DO UPDATE SET
              transcribe_base_url = EXCLUDED.transcribe_base_url,
-             transcribe_api_key = CASE
-                 WHEN $5 IS NOT NULL AND $5 <> llm_settings.transcribe_provider
-                 THEN EXCLUDED.transcribe_api_key
-                 ELSE COALESCE(EXCLUDED.transcribe_api_key, llm_settings.transcribe_api_key) END,
+             transcribe_api_key = COALESCE(EXCLUDED.transcribe_api_key, llm_settings.transcribe_api_key),
              transcribe_model    = EXCLUDED.transcribe_model,
-             transcribe_provider = COALESCE($5, llm_settings.transcribe_provider),
              updated_at          = now()
          RETURNING *",
     )
@@ -264,7 +237,6 @@ pub async fn upsert_transcribe_with_provider(
     .bind(base_url)
     .bind(api_key)
     .bind(model)
-    .bind(provider)
     .fetch_one(pool)
     .await?;
     opened(row)

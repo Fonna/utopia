@@ -2,6 +2,4 @@
 ALTER TABLE llm_settings
     ADD COLUMN ocr_provider TEXT NOT NULL DEFAULT 'mineru'
         CHECK (ocr_provider IN ('mineru', 'ark')),
-    ADD COLUMN ocr_model TEXT,
-    ADD COLUMN transcribe_provider TEXT NOT NULL DEFAULT 'openai'
-        CHECK (transcribe_provider IN ('openai', 'ark'));
+    ADD COLUMN ocr_model TEXT;

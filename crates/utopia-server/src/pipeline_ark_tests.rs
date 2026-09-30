@@ -59,7 +59,7 @@ async fn configure(f: &Fx, replies: &OcrReplies) -> anyhow::Result<MockServer> {
         .respond_with(replies.clone())
         .mount(&server)
         .await;
-    settings::upsert_ocr_with_provider(
+    settings::upsert_ocr(
         &f.pool,
         f.ws,
         Some(&server.uri()),
@@ -392,7 +392,7 @@ async fn configuring_the_reader_again_preserves_completed_pages() -> anyhow::Res
     )
     .is_some());
     let paid = task(&f, doc).await?;
-    settings::upsert_ocr_with_provider(&f.pool, f.ws, None, None, None, Some("ark"), None).await?;
+    settings::upsert_ocr(&f.pool, f.ws, None, None, None, Some("ark"), None).await?;
     let error = crate::pipeline::process_document(&f.state, doc)
         .await
         .unwrap_err();
@@ -403,7 +403,7 @@ async fn configuring_the_reader_again_preserves_completed_pages() -> anyhow::Res
     );
     assert_eq!(task(&f, doc).await?["pages"], paid["pages"]);
 
-    settings::upsert_ocr_with_provider(
+    settings::upsert_ocr(
         &f.pool,
         f.ws,
         Some(&server.uri()),
@@ -639,7 +639,7 @@ async fn a_configuration_change_during_read_rejects_the_late_page_and_ready() ->
     let owner = tokio::spawn(async move { crate::pipeline::process_document(&state, doc).await });
     wait_for_request(&replies).await;
     let checkpoint = task(&f, doc).await?;
-    settings::upsert_ocr_with_provider(
+    settings::upsert_ocr(
         &f.pool,
         f.ws,
         Some(&server.uri()),
@@ -748,7 +748,7 @@ async fn stale_checkpoints_cannot_write_pages_chunks_status_ready_or_failure() -
         old.prepared_updated_at = None;
         match change {
             "configuration" => {
-                settings::upsert_ocr_with_provider(
+                settings::upsert_ocr(
                     &f.pool,
                     f.ws,
                     Some("https://other.invalid"),
