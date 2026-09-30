@@ -1,6 +1,6 @@
 # 0065 · The OCR reader chooses its provider
 
-- **Status**: Implemented · 2026-09-30 · migration 0101 · open: none
+- **Status**: Implemented · 2026-09-30 · migration 0102 · open: none
 - **Written**: 2026-09-30 (conventions in the [README](README.md))
 - **Related**: [0040](0040-a-chunk-says-where-its-words-came-from.md) (readers and the evidence contract); [#1006](https://github.com/deeplethe/utopia/issues/1006) (the proposal, by Fonna); [#1007](https://github.com/deeplethe/utopia/pull/1007) (their implementation, which this record narrows)
 
